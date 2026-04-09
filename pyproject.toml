@@ -1,4 +1,4 @@
-l[project]
+[project]
 name = "tools4magaox"
 version = "0.1.0"
 description = "tools for MagAO-X dataprocessing"
