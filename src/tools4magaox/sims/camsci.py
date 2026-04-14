@@ -49,9 +49,20 @@ class CamsciSim(object):
         self.px_resolution = self.px_ang_size / (self.spatial_resolution * RAD_TO_AS) # lamD / px
         self.n_lD_w = (n_px_w * bin) * self.px_resolution # lamD
 
+    def setup_camera(self):
+        '''
+        Setting up all the grids and things
+        '''
+        self.make_pupilgrid()
+        self.make_focalgrid()
+        self.make_prop()
+        return self.pupil_grid, self.focal_grid, self.prop
+
     def make_pupilgrid(self):
         '''
-        this pupil grid is based on WFS so subject to change
+        this pupil grid is trying to be a goldilocks
+        not too small to avoid ailiasing
+        not too big so that we mess up runtimes
         '''
         self.n_pix_pupil = 256
         self.pupil_grid = make_pupil_grid(self.n_pix_pupil, diameter=self.D)
