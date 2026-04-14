@@ -12,41 +12,66 @@ from scipy.special import j1
 
 ############ Center ID Functions #############
 
-def gaussian_fit_center(data):
+def gaussian_fit_center(data, crop_shape=None):
     '''
     This function will fit a gaussian to the unsats data and return the center of the gaussian
     Eventually should also handle cropping the data for the fitting. 
     '''
     # iteratively fir a gaussian to the data
     # return the coordinates of the center of the gaussian
-
     cube = np.asarray(data)
+    # Expect a data cube of shape (N, H, W)
+    if cube.ndim != 3 or cube.shape[0] == 0:
+        return (None, None)
+    # if desired, crop to a smaller shape
+    if crop_shape is not None:
+        cube = crop_cube(cube, crop_shape)
+
+    # call gaussian fitter code here
+
     return 
 
-def DAO_fit_centers(data):
+def DAO_fit_centers(data, crop_shape=None):
     '''
     This function finds the center of the PSF using DAOstarfinder routine
     '''
     # this finds the sources in a numpy cube
     cube = np.asarray(data)
-
     # Expect a data cube of shape (N, H, W)
     if cube.ndim != 3 or cube.shape[0] == 0:
         return (None, None)
-    
+    # if desired, crop to a smaller shape
+    if crop_shape is not None:
+        cube = crop_cube(cube, crop_shape)
+
     sources_info = _DAO_check_sources(cube)
     sources_list = sources_info['sources']
-    centers = _DAO_xy_centers(sources_list)
-    #shifts = _DAO_xy_shifts(sources_list, cube.shape[1:])
+    shifts = _DAO_xy_shifts(sources_list, cube.shape[1:])
+    # if looking for centers, need to convert to the original size centers
+    #centers = _DAO_xy_centers(sources_list)
 
     # TODO: handle the bad indexes elegantly 
-    return centers
+    return shifts
 
 def weighted_sum_center(data):
     '''
     This function will return the center of the unsats data using a weighted sum of the coordinates
     '''
     pass
+
+def crop_cube(cube, new_shape=(64,64), center_shift=(0,0)):
+    '''
+    This function will crop a cube to a new shape
+    from the center of the cube with a given center shift
+    '''
+    shape = cube.shape
+    center = (shape[1] // 2, shape[2] // 2)
+    new_center = (center[0] + center_shift[0], center[1] + center_shift[1])
+    # TODO: this doesn't work for odd shapes
+    x_i, x_f = new_center[0] - new_shape[0] // 2, new_center[0] + new_shape[0] // 2
+    y_i, y_f = new_center[1] - new_shape[1] // 2, new_center[1] + new_shape[1] // 2
+    new_cube = cube[:, x_i:x_f, y_i:y_f]
+    return new_cube
 
 
 ############ Helper Functions ##################
@@ -106,6 +131,64 @@ def _DAO_xy_shifts(sources_list, frame_shape):
     shifts = centers - frame_center
     return shifts
 
+def _gaussian_fit_curvefit(cube):
+    cube = np.asarray(cube)
+    grid = Grid(cube.shape[1:])
+    bad_idx = []
+    sources_list = []
+
+    for i, frame in enumerate(cube):
+        # set up guesses per frame
+        offset_guess = np.median(frame)
+        amp_guess = np.max(frame) - offset_guess
+        params = GaussParams(
+            center_x=grid.x_center, 
+            center_y=grid.y_center, 
+            sigma_x=1, 
+            sigma_y=1, 
+            amplitude=amp_guess, 
+            offset=offset_guess)
+        # making the fit function
+        cost_func = _gaussian_fit_function(frame, grid)
+        # optimizing the fit
+        params_opt = scipy.optimize.curve_fit(guassian_2d, params)
+
+def _gaussian_fit_minimize(cube):
+    cube = np.asarray(cube)
+    grid = Grid(cube.shape[1:])
+    bad_idx = []
+    sources_list = []
+
+    for i, frame in enumerate(cube):
+        # set up guesses per frame
+        offset_guess = np.median(frame)
+        amp_guess = np.max(frame) - offset_guess
+        params = GaussParams(
+            center_x=grid.x_center, 
+            center_y=grid.y_center, 
+            sigma_x=1, 
+            sigma_y=1, 
+            amplitude=amp_guess, 
+            offset=offset_guess)
+        # making the fit function
+        cost_func = _gaussian_fit_function(frame, grid)
+        # optimizing the fit
+        params_opt = scipy.optimize.minimize(cost_func, params)
+        sources_list.append(params_opt['x'])
+        # barebones, could probably do better
+        if not params_opt['success']:
+            bad_idx.append(i)
+    return {'bad_idx': bad_idx, 'sources': sources_list}
+
+
+def _gaussian_fit_function(frame: np.ndarray, grid: Grid):
+    # define a fit function as a cost function
+    # specific to the image
+    def fit_func(params: GaussParams):
+        gaus_sim = gaussian_2d(grid, params)
+        return np.sum((frame - gaus_sim)**2)
+    return fit_func
+
 
 ############ Shifting Functions ################
 
@@ -125,7 +208,6 @@ def shift_field(data, shift):
 	else:
 		return Field(ndimage.shift(data.shaped, np.array([0, shift[1], shift[0]]) / data.grid.delta[0]).reshape((data.shape[0], -1)), data.grid)
 
-
 def shift_cube(data, shift):
     '''
     This function will shift a cube by a given shift
@@ -134,10 +216,16 @@ def shift_cube(data, shift):
 
 ########### Simulated Data Functions ################
 
-@dataclass(frozen=True)
 class Grid:
-    x: np.ndarray
-    y: np.ndarray
+    def __init__(self, shape):
+        self.nx = shape[0]
+        self.ny = shape[1]
+        self.x = np.arange(self.nx)
+        self.y = np.arange(self.ny)
+        self.xx, self.yy = np.meshgrid(self.x, self.y)
+        self.xy = np.vstack((self.xx.ravel(), self.yy.ravel()))
+        self.x_center = self.x[self.nx // 2]
+        self.y_center = self.y[self.ny // 2]
 
 @dataclass(frozen=True)
 class GaussParams:
@@ -153,39 +241,6 @@ def gaussian_2d(grid: Grid, params: GaussParams):
     This function generates a 2D gaussian function
     '''
     return params.amplitude * np.exp(-(grid.x - params.center_x)**2 / (2 * params.sigma_x**2) - (grid.y - params.center_y)**2 / (2 * params.sigma_y**2)) + params.offset
-
-@dataclass(frozen=True)
-class AiryDiskParams:
-    center_x: float
-    center_y: float
-    fwhm: float
-    amp: float
-
-def airyfnc_2d(grid: Grid, params: AiryDiskParams):
-    '''
-    This function generates a PSF with given amounts of noise.
-    There is an error at the zero point because of a zero pole...
-    Not sure how to analytically handle this, feels like a fft moment
-    '''
-    r = np.sqrt((grid.x - params.center_x)**2 + (grid.y - params.center_y)**2)
-    psf = (2*j1(r/params.fwhm) / r / params.fwhm)**2
-    return psf * params.amp
-
-def airydisk_2d(grid: Grid, params: AiryDiskParams):
-    '''
-    Doing this with an FFT from the  
-    '''
-     
-def simulate_psf(grid, params: AiryDiskParams, read_noise=0.2):
-    ''' 
-    This function simulates a PSF with given amounts of noise
-    '''
-    num_pixels = grid.shape[0] * grid.shape[1]
-    psf = airydisk_2d(grid, params)
-    phot_noise = np.random.poisson(psf, (num_pixels,num_pixels))
-    readout_noise = np.random.normal(read_noise, size=psf.shape)
-
-    return psf + phot_noise + readout_noise
 
 ####################################################
 ############### Helper Functions ###################
