@@ -88,25 +88,29 @@ class CamsciSim(object):
         psf = self.prop(wf).intensity
         return psf
 
-    def camsci_image(self, s_mag, t_int, EMGAIN=1.0, saturation=False):
+    def camsci_image(self, s_mag, t_int, EMGAIN=1.0, saturation=False, verbose=False):
         psf = self.camsci_psf()
         phot_flux_ct = self.camsci_mag_to_phot_flux(s_mag, t_int) # total e- on the detector in time frame
         # scale the PSF by photon_flux
         psf = psf * ( phot_flux_ct / np.sum(psf) )
         shot_noise = np.random.poisson(psf)
         photons = psf + shot_noise
+        if verbose: print(f"Max photon count:   {np.max(photons)}")
         # convert to detector
         QE = filt_dict[self.filter_name]["QE"] # quantum efficiency
         electrons = photons * QE * EMGAIN
         # TODO: clean up how I'm handling electron based noise:
         dark_e = np.random.normal(scale=self.dark_noise, size=electrons.shape)
         electrons_out  = electrons + dark_e
+        if verbose: print(f"Max electron count: {np.max(electrons_out)}")
         # Digitization of the signal
         bias = 600
-        ADU = (electrons_out + bias).astype(int)
+        ADU = (electrons_out/2.32).astype(int)
+        ADU += bias
         if saturation:
             max_adu = int(2**self.bitdepth - 1)
             ADU = np.clip(ADU, 0, max_adu)
+        if verbose:print(f"Max ADU count:       {np.max(ADU)}")
         return ADU
 
     def camsci_mag_to_phot_flux(self, s_mag, t_int):
