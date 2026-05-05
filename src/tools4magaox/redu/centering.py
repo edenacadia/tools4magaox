@@ -12,24 +12,6 @@ from photutils.detection import DAOStarFinder
 from hcipy import *
 from scipy.special import j1
 
-#region agent log
-def _agent_log(*, runId: str, hypothesisId: str, location: str, message: str, data: dict):
-    import json, time
-    payload = {
-        "sessionId": "05c9b8",
-        "runId": runId,
-        "hypothesisId": hypothesisId,
-        "location": location,
-        "message": message,
-        "data": data,
-        "timestamp": int(time.time() * 1000),
-    }
-    try:
-        with open("/Users/clever/code/proj_research/tools4magaox/.cursor/debug-05c9b8.log", "a", encoding="utf-8") as f:
-            f.write(json.dumps(payload) + "\n")
-    except Exception:
-        pass
-#endregion
 
 ############ Center ID Functions #############
 
@@ -67,33 +49,8 @@ def DAO_fit_shifts(data, crop_shape=None):
     if crop_shape is not None:
         cube = crop_cube(cube, crop_shape)
 
-    #region agent log
-    _agent_log(
-        runId="pre-fix",
-        hypothesisId="H1",
-        location="centering.py:DAO_fit_shifts",
-        message="Entering DAO_fit_shifts",
-        data={"cube_shape": list(np.shape(cube)), "crop_shape": list(crop_shape) if crop_shape is not None else None},
-    )
-    #endregion
-
     sources_info = _DAO_check_sources(cube)
     sources_list = sources_info['sources']
-
-    #region agent log
-    _agent_log(
-        runId="pre-fix",
-        hypothesisId="H1",
-        location="centering.py:DAO_fit_shifts",
-        message="DAO sources summary",
-        data={
-            "n_frames": int(np.shape(cube)[0]),
-            "bad_idx": list(sources_info.get("bad_idx", [])),
-            "multi_idx": list(sources_info.get("multi_idx", [])),
-            "sources_none_count": int(sum(1 for s in sources_list if s is None)),
-        },
-    )
-    #endregion
 
     shifts = _DAO_xy_shifts(sources_list, cube.shape[1:])
     # if looking for centers, need to convert to the original size centers
@@ -313,11 +270,13 @@ def shift_field(data, shift):
 	else:
 		return Field(ndimage.shift(data.shaped, np.array([0, shift[1], shift[0]]) / data.grid.delta[0]).reshape((data.shape[0], -1)), data.grid)
 
-def shift_cube(data, shift):
+def shift_cube(data_cube, shifts):
     '''
     This function will shift a cube by a given shift
     '''
-    pass
+    for i, frame in enumerate(data_cube):
+        data_cube[i] = shift_frame(frame, shifts[i])
+    return data_cube
 
 ########### Simulated Data Functions ################
 
