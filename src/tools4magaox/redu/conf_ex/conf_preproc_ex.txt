@@ -1,0 +1,17 @@
+# This is an example preprocess configuration file 
+# use only one unsats dir per conf to specify filter params
+
+obs_path = "/Volumes/magaox_bpic/edenmcewen@arizona.edu/"
+redu_path = "/Volumes/magaox_bpic/redu/"
+
+unsats_dir = "2025-12-01_081206_beta_pic_piaa_unsats"
+
+cameras = ["camsci1", "camsci2"]
+
+plot = True
+force_rerun = False
+fit_func = "gauss_min"
+
+max_files = -1
+pct_cut = 20
+
