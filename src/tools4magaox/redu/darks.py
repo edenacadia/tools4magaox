@@ -181,6 +181,249 @@ def _detect_camera_tag_from_header(hdr):
             return "CAMSCI2"
     return None
 
+def _masterdark_params_match(ref, cand_vals):
+    """Compare dicts from ``pull_hdr_params(..., darks=False)`` (same keys)."""
+    for k in ref:
+        a = ref[k]
+        b = cand_vals[k]
+        if a is None or b is None:
+            return False
+        try:
+            a_f = float(a)
+            b_f = float(b)
+            if not np.isclose(a_f, b_f, atol=1e-6):
+                return False
+        except Exception:
+            if str(a) != str(b):
+                return False
+    return True
+
+
+# Columns that identify a detector setup for masterdark matching (same as
+# ``darks.pull_hdr_params(..., darks=False)``). ``SHUTTER`` is omitted because
+# science frames differ from darks only by shutter state.
+_UNIQ_DARK_LOOKUP_COLS = (
+    "camera",
+    "NAXIS1",
+    "NAXIS2",
+    "ROI_XCEN",
+    "ROI_YCEN",
+    "EMGAIN",
+    "ADC_SPEED",
+    "EXPTIME",
+)
+
+def unique_telemetry_configs_for_dark_lookup(table, camera=None):
+    """
+    Collapse a per-file telemetry table to unique detector configurations.
+
+    Drops per-exposure fields (``filename``, ``DATE_OBS``, ``PARANG``) and
+    ignores ``SHUTTER`` when uniquifying, since :func:`darks.find_masterdark_for_params`
+    matches the same seven numeric / ROI parameters as
+    :func:`darks.find_masterdark_for_file` (shutter is not part of that match).
+
+    Parameters
+    ----------
+    table : astropy.table.Table
+        E.g. from :func:`fits_telemetry_table` (must contain the columns in
+        ``_UNIQ_DARK_LOOKUP_COLS`` except ``camera`` may be filled via ``camera``).
+    camera : str, optional
+        If the table has no ``camera`` column, this value is applied to every row.
+
+    Returns
+    -------
+    astropy.table.Table
+        One row per unique combination of camera + NAXIS / ROI / gain / ADC / exptime.
+    """
+    from astropy.table import unique as table_unique
+
+    t = table.copy()
+    if "camera" not in t.colnames:
+        if camera is None:
+            raise ValueError(
+                "telemetry table has no 'camera' column; pass camera='camsci1' (or similar)."
+            )
+        t["camera"] = camera
+    keys = [k for k in _UNIQ_DARK_LOOKUP_COLS if k in t.colnames]
+    missing = [k for k in _UNIQ_DARK_LOOKUP_COLS if k not in keys]
+    if missing:
+        raise ValueError(f"telemetry table missing columns required for dark lookup: {missing}")
+    return table_unique(t[keys], keys=keys)
+
+
+def lookup_masterdarks_from_telemetry_table(
+    table, redu_dir="/Volumes/magaox_bpic/redu", camera=None
+):
+    """
+    For each unique detector configuration in ``table``, call
+    :func:`darks.find_masterdark_for_params`.
+
+    Parameters
+    ----------
+    table : astropy.table.Table
+        From :func:`fits_telemetry_table` or compatible.
+    redu_dir : str
+        Passed to :func:`darks.find_masterdark_for_params`.
+    camera : str, optional
+        Used only if ``table`` has no ``camera`` column.
+
+    Returns
+    -------
+    list of dict
+        One entry per unique config, with keys matching the masterdark match
+        dict plus ``masterdark_paths`` (list of str).
+    """
+    from darks import find_masterdark_for_params
+
+    uniq = unique_telemetry_configs_for_dark_lookup(table, camera=camera)
+    results = []
+    for row in uniq:
+        cam = row["camera"]
+        params = {
+            "NAXIS1": row["NAXIS1"],
+            "NAXIS2": row["NAXIS2"],
+            "ROI_XCEN": row["ROI_XCEN"],
+            "ROI_YCEN": row["ROI_YCEN"],
+            "EMGAIN": row["EMGAIN"],
+            "ADC_SPEED": row["ADC_SPEED"],
+            "EXPTIME": row["EXPTIME"],
+        }
+        paths = find_masterdark_for_params(params, cam, redu_dir=redu_dir)
+        results.append(
+            {
+                "camera": cam,
+                **params,
+                "masterdark_paths": paths,
+            }
+        )
+    return results
+
+def merge_file_table_with_darks(
+    file_table,
+    dark_lookup_results,
+    dark_col="masterdark_path",
+):
+    """
+    Add a masterdark path column to a per-file telemetry table.
+
+    Parameters
+    ----------
+    file_table : astropy.table.Table
+        Table with (at minimum) the columns:
+        ``camera``, ``NAXIS1``, ``NAXIS2``, ``ROI_XCEN``, ``ROI_YCEN``,
+        ``EMGAIN``, ``ADC_SPEED``, ``EXPTIME``.
+    dark_lookup_results : list[dict]
+        Output from a dark lookup step, with one dict per *unique* configuration.
+        Each dict must contain the same identifying keys as above plus
+        ``masterdark_paths`` (list of str). The *first* path is used.
+    dark_col : str
+        Name of the new column to add to ``file_table``.
+
+    Returns
+    -------
+    astropy.table.Table
+        Copy of ``file_table`` with an added ``dark_col`` column containing the
+        first matching masterdark path (or ``""`` if no match).
+    """
+    required = (
+        "camera",
+        "NAXIS1",
+        "NAXIS2",
+        "ROI_XCEN",
+        "ROI_YCEN",
+        "EMGAIN",
+        "ADC_SPEED",
+        "EXPTIME",
+    )
+    missing = [c for c in required if c not in file_table.colnames]
+    if missing:
+        raise ValueError(f"file_table missing required columns: {missing}")
+
+    # Map (camera + config params) -> first masterdark path
+    def _key(d):
+        return (
+            str(d["camera"]),
+            d["NAXIS1"],
+            d["NAXIS2"],
+            d["ROI_XCEN"],
+            d["ROI_YCEN"],
+            d["EMGAIN"],
+            d["ADC_SPEED"],
+            d["EXPTIME"],
+        )
+
+    cfg_to_dark = {}
+    for d in dark_lookup_results:
+        if any(k not in d for k in required) or "masterdark_paths" not in d:
+            continue
+        paths = d.get("masterdark_paths") or []
+        cfg_to_dark[_key(d)] = paths[0] if len(paths) > 0 else ""
+
+    out = file_table.copy()
+    out[dark_col] = [
+        cfg_to_dark.get(
+            (
+                str(row["camera"]),
+                row["NAXIS1"],
+                row["NAXIS2"],
+                row["ROI_XCEN"],
+                row["ROI_YCEN"],
+                row["EMGAIN"],
+                row["ADC_SPEED"],
+                row["EXPTIME"],
+            ),
+            "",
+        )
+        for row in out
+    ]
+    return out
+
+def find_masterdark_for_params(params, camera, redu_dir="/Volumes/magaox_bpic/redu"):
+    """
+    Search ``redu_dir`` for masterdark FITS whose headers match ``params``.
+
+    Parameters
+    ----------
+    params : dict
+        Same keys as ``pull_hdr_params(hdr, camera, darks=False)``: NAXIS1,
+        NAXIS2, ROI_XCEN, ROI_YCEN, EMGAIN, ADC_SPEED, EXPTIME.
+    camera : str
+        Detector id, e.g. ``"camsci1"``.
+    redu_dir : str
+        Root directory to search (recursive glob for ``*masterdark*.fits*``).
+
+    Returns
+    -------
+    list of str
+        Paths to matching masterdark files (possibly empty).
+    """
+    params_pretty = ["{}={}".format(k, params[k]) for k in params]
+    print("   ", params_pretty)
+    pattern = os.path.join(redu_dir, "**", "*masterdark*.fits*")
+    candidates = sorted(glob.glob(pattern, recursive=True))
+
+    matches = []
+    cam = camera.lower()
+    for cand in candidates:
+        try:
+            with fits.open(cand, memmap=False) as fhc:
+                hdrc = fhc[0].header
+            cam_cand = _detect_camera_tag_from_header(hdrc)
+            if cam_cand is None:
+                print(f"   Could not detect camera tag from candidate {cand}")
+                continue
+            if cam_cand.lower() != cam:
+                continue
+            cand_vals = pull_hdr_params(hdrc, cam_cand, darks=False)
+        except Exception:
+            continue
+
+        if _masterdark_params_match(params, cand_vals):
+            matches.append(cand)
+
+    return matches
+
+
 def find_masterdark_for_file(file_path, camera="camsci1", redu_dir="/Volumes/magaox_bpic/redu"):
     """
     Given a FITS file (raw dark or otherwise), search redu_dir for a masterdark
@@ -193,52 +436,8 @@ def find_masterdark_for_file(file_path, camera="camsci1", redu_dir="/Volumes/mag
     with fits.open(file_path, memmap=False) as fh:
         hdr = fh[0].header.copy()
 
-    # extract key params from the provided file
-    params = pull_hdr_params(hdr, camera, darks=False) # we don't care about SHUTTER
-    params_pretty = ["{}={}".format(k, params[k]) for k in params]
-    print("   ", params_pretty)
-    # build glob pattern to find candidate masterdark files that include the tokens
-    # look for any files under redu_dir that contain 'masterdark' and these numeric tokens
-    pattern = os.path.join(redu_dir, "**", "*masterdark*.fits*")
-    candidates = sorted(glob.glob(pattern, recursive=True))
-
-    matches = []
-    for cand in candidates:
-        try:
-            with fits.open(cand, memmap=False) as fhc:
-                hdrc = fhc[0].header
-            # pull same set of params from candidate header (try camera tag from candidate if available)
-            cam_cand = _detect_camera_tag_from_header(hdrc)
-            if cam_cand is None:
-                print(f"   Could not detect camera tag from candidate {cand}")
-                continue
-            # extract key params from the provided file
-            if cam_cand.lower() != camera.lower():
-                continue
-            cand_vals = pull_hdr_params(hdrc, cam_cand, darks=False)
-        except Exception:
-            continue
-
-        # compare params (use isclose for floats)
-        ok = True
-        for k in params:
-            a = params[k]
-            b = cand_vals[k]
-            if a is None or b is None:
-                ok = False
-                break
-            try:
-                a_f = float(a); b_f = float(b)
-                if not np.isclose(a_f, b_f, atol=1e-6):
-                    ok = False; break
-            except Exception:
-                if str(a) != str(b):
-                    ok = False; break
-
-        if ok:
-            matches.append(cand)
-
-    return matches
+    params = pull_hdr_params(hdr, camera, darks=False)
+    return find_masterdark_for_params(params, camera, redu_dir=redu_dir)
 
 def find_masterdark_by_params(naxis1, naxis2, emgain, adc_speed, exptime, redu_dir="/Volumes/magaox_bpic/redu"):
     """

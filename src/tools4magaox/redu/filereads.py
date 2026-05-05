@@ -1,11 +1,100 @@
 # filereads.py
 # 2026/04/07
 # the purpose of this file is to coordinate how files and telemetry is read into the reduction pipeline
+import os
+from tqdm import trange, tqdm
+from astropy.table import Table
+from darks import _detect_camera_tag_from_header
+
 from astropy.io import fits
 import numpy as np
 
+
+def pull_hdr_params(hdr, camera, darks=True):
+    vals = {
+            "DATE_OBS": hdr.get("DATE-OBS"),
+            "PARANG": hdr.get("PARANG"),
+            "NAXIS1": _find_hdr_val(hdr, "NAXIS1"),
+            "NAXIS2": _find_hdr_val(hdr, "NAXIS2"),
+            "ROI_XCEN": _find_hdr_val(hdr, "ROI_XCEN", camera_tag=camera),
+            "ROI_YCEN": _find_hdr_val(hdr, "ROI_YCEN", camera_tag=camera),
+            "EMGAIN": _find_hdr_val(hdr, "EMGAIN", camera_tag=camera),
+            "ADC_SPEED": _find_hdr_val(hdr, "ADC SPEED", camera_tag=camera),
+            "EXPTIME": _find_hdr_val(hdr, "EXPTIME", camera_tag=camera),
+            "SHUTTER": _find_hdr_val(hdr, "SHUTTER", camera_tag=camera),
+        }
+    return vals
+
+def fits_telemetry_table(file_paths, camera=None):
+    """
+    Build an Astropy ``Table`` with one row per FITS file: filename, acquisition
+    time (``DATE-OBS``), ``PARANG``, and camera/detector keywords from the header.
+
+    Camera-specific keywords (``ROI_*``, ``EMGAIN``, ``ADC SPEED``, ``EXPTIME``,
+    ``SHUTTER``) are resolved the same way as in ``darks.pull_hdr_params``.
+
+    Parameters
+    ----------
+    file_paths : list of str or path-like, or a single path
+        FITS files to summarize.
+    camera : str, optional
+        Detector id, e.g. ``"camsci1"``. If omitted, each file's camera is
+        inferred from HIERARCH keys when possible; otherwise this value must be
+        set for files without a detectable tag.
+
+    Returns
+    -------
+    astropy.table.Table
+        Columns: ``filename``, ``camera``, ``DATE_OBS``, ``PARANG``, ``NAXIS1``,
+        ``NAXIS2``, ``ROI_XCEN``, ``ROI_YCEN``, ``EMGAIN``, ``ADC_SPEED``,
+        ``EXPTIME``, ``SHUTTER``. Missing ``PARANG`` is stored as NaN; missing
+        optional keywords are None.
+    """
+
+    if isinstance(file_paths, (str, os.PathLike)):
+        file_paths = [file_paths]
+
+    rows = []
+    for fp in file_paths:
+        fp = os.fspath(fp)
+        name = os.path.basename(fp)
+        with fits.open(fp, memmap=False) as fh:
+            hdr = fh[0].header
+        cam = camera
+        if cam is None:
+            det = _detect_camera_tag_from_header(hdr)
+            cam = det.lower() if det else None
+        if cam is None:
+            raise ValueError(
+                f"Could not infer camera for {fp}; pass camera='camsci1' or 'camsci2'."
+            )
+        vals = pull_hdr_params(hdr, cam, darks=True)
+        rows.append(
+            {
+                "filename": name,
+                "camera": cam,
+                "DATE_OBS": vals["DATE_OBS"],
+                "PARANG": vals["PARANG"],
+                "NAXIS1": vals["NAXIS1"],
+                "NAXIS2": vals["NAXIS2"],
+                "ROI_XCEN": vals["ROI_XCEN"],
+                "ROI_YCEN": vals["ROI_YCEN"],
+                "EMGAIN": vals["EMGAIN"],
+                "ADC_SPEED": vals["ADC_SPEED"],
+                "EXPTIME": vals["EXPTIME"],
+                "SHUTTER": vals["SHUTTER"],
+            }
+        )
+    return Table(rows)
+
+def write_fits(data, save_path):
+    data = np.asarray(data)
+    hdu = fits.PrimaryHDU(data=data)
+    hdu.writeto(save_path, overwrite=True)
+    return save_path
+
 # TODO: Make sure the cube isn't too large
-def make_data_cube(file_list, dark_data, n_avg=1, n_files=-1):
+def make_data_avg_cube(file_list, dark_data, n_avg=1, n_files=-1):
     n_files = len(file_list) if n_files == -1 else n_files
     n_avg_data = n_files // n_avg
     avg_data = np.zeros((n_avg_data, dark_data.shape[0], dark_data.shape[1]))
@@ -18,12 +107,13 @@ def make_data_cube(file_list, dark_data, n_avg=1, n_files=-1):
         avg_data[i] /=n_avg
     return avg_data
 
-def write_fits(data, save_path):
-    data = np.asarray(data)
-    hdu = fits.PrimaryHDU(data=data)
-    hdu.writeto(save_path, overwrite=True)
-    return save_path
-
+def make_data_cube(file_list, dark_data, n_files=-1):
+    n_files = len(file_list) if n_files == -1 else n_files
+    data_cube = np.zeros((n_files, dark_data.shape[0], dark_data.shape[1]))
+    for i in range(n_files):
+        demo_data = fits.open(file_list[i])[0].data
+        data_cube[i] = demo_data.astype(float) - dark_data
+    return data_cube
 
 # TODO: Make a cube and keep relevant telemetry 
 
@@ -112,3 +202,30 @@ def coadd_by_time(data, time_cube, parang_cube, time_coadd=10):
     """
     # TODO
     pass
+
+
+############## File checking functions ###############
+
+def _norm_key(k):
+    return str(k).upper().replace("HIERARCH", "").replace(" ", "").replace("_", "").replace("'", "")
+
+def _find_hdr_val(hdr, key, camera_tag=None):
+    wanted = str(key).upper().replace(" ", "").replace("_", "")
+    #print(f"Looking for key '{key}' (normalized: '{wanted}') in header with camera tag '{camera_tag}'")
+    if camera_tag:
+        cam_wanted = camera_tag.upper() + wanted
+    else:
+        cam_wanted = None
+    if cam_wanted:
+        # 1) camera-specific
+        for k in hdr.keys():
+            nk = _norm_key(k)
+            if cam_wanted in nk:
+                return hdr[k]
+    else:
+        # 2) generic key
+        for k in hdr.keys():
+            nk = _norm_key(k)
+            if nk == wanted or nk.startswith(wanted) or wanted in nk:
+                return hdr[k]
+    return None
