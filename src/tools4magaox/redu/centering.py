@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from astropy.stats import sigma_clipped_stats
 from photutils.detection import DAOStarFinder
 from hcipy import *
-from scipy.special import j1
+from tqdm import tqdm
 
 
 ############ Center ID Functions #############
@@ -194,8 +194,8 @@ def _gaussian_fit_curvefit(cube):
         offset_guess = np.median(frame)
         amp_guess = np.max(frame) - offset_guess
         params = (
-            grid.x_center, 
             grid.y_center, 
+            grid.x_center, 
             1, 
             1, 
             amp_guess, 
@@ -211,13 +211,13 @@ def _gaussian_fit_minimize(cube):
     bad_idx = []
     sources_list = []
 
-    for i, frame in enumerate(cube):
+    for i, frame in enumerate(tqdm(cube)):
         # set up guesses per frame
         offset_guess = np.median(frame)
         amp_guess = np.max(frame) - offset_guess
         params_0 = (
-            grid.x_center, 
             grid.y_center, 
+            grid.x_center, 
             1,  # sigma_x 
             1,  # sigma_y
             amp_guess, 
@@ -291,7 +291,7 @@ class Grid:
         self.x_center = self.x[self.nx // 2]
         self.y_center = self.y[self.ny // 2]
 
-def gaussian_2d(grid: Grid, x0, y0, sigma_x, sigma_y, amplitude, offset):
+def gaussian_2d(grid: Grid, y0, x0, sigma_y, sigma_x, amplitude, offset):
     '''
     This function generates a 2D gaussian function
     '''
