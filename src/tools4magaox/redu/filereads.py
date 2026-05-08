@@ -8,6 +8,7 @@ from darks import _detect_camera_tag_from_header
 
 from astropy.io import fits
 import numpy as np
+from datetime import datetime, timezone
 
 
 def pull_hdr_params(hdr, camera, darks=True):
@@ -271,7 +272,16 @@ def _coerce_times_to_datetime64(times):
         if s in ("", "None", "nan", "NaN", "-1"):
             continue
         try:
-            out[i] = np.datetime64(s).astype("datetime64[us]")
+            # numpy.datetime64 has no timezone support. If DATE-OBS includes a timezone
+            # (e.g. "Z" or "+00:00"), normalize to UTC and drop tzinfo before casting.
+            if s.endswith("Z"):
+                s_iso = s[:-1] + "+00:00"
+            else:
+                s_iso = s
+            dt = datetime.fromisoformat(s_iso)
+            if dt.tzinfo is not None:
+                dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+            out[i] = np.datetime64(dt).astype("datetime64[us]")
         except Exception:
             # Leave as NaT if unparseable
             pass
