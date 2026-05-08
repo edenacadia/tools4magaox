@@ -14,7 +14,7 @@ from hcipy import *
 from scipy import ndimage
 import scipy
 
-from constants import *
+from tools4magaox.constants import *
 import darks as md
 import filtering as fl
 import filereads as fr
@@ -27,10 +27,26 @@ CLEAN_CUBE_NAME = "clean_cube.fits"
 CENTERED_CUBE_NAME = "centered_cube.fits"
 AVERAGE_IMAGE_NAME = "average_image.fits"
 
+
+def _resolve_masterdark_search_dir(redu_path, masterdark_dir):
+    """Directory tree to search for ``*masterdark*.fits*`` (recursive)."""
+    if masterdark_dir is not None:
+        s = os.path.expanduser(os.fspath(masterdark_dir)).strip()
+        if s:
+            return s
+    return os.path.expanduser(os.fspath(redu_path)).strip()
+
+
+def _load_fits_primary_float32(path):
+    """Load primary HDU data as float32 (reduces RAM vs float64 cubes)."""
+    with fits.open(path, memmap=False) as hdul:
+        return np.asarray(hdul[0].data, dtype=np.float32)
+
+
 ############# Main Functions #############
 
 # STEP 0
-def find_filetable(redu_dir, obs_path, unsats_dir, camera, max_files, force_rerun=False):
+def find_filetable(redu_dir, obs_path, unsats_dir, camera, max_files, redu_path, force_rerun=False, masterdark_dir=None):
     '''
     Checks to see if the table exists in redu_path
     If it doesn't, it's created
@@ -47,7 +63,8 @@ def find_filetable(redu_dir, obs_path, unsats_dir, camera, max_files, force_reru
         unsat_files = find_files(obs_path, unsats_dir, camera, max_files)
         unsats_table = fr.fits_telemetry_table(unsat_files, camera)
         # 0.1 - dark files needed merged with file table
-        file_table_darks = find_dark_files(redu_dir, unsats_table, camera)
+        dark_search_dir = _resolve_masterdark_search_dir(redu_path, masterdark_dir)
+        file_table_darks = find_dark_files(dark_search_dir, unsats_table, camera)
         # 0.2 - pick the parameters that are in the largest number of files
         file_table = pick_unsat_params(file_table_darks)
         # 0.3 - write the file table
@@ -64,7 +81,7 @@ def make_clean_cube(file_table_total, redu_dir, obs_path, unsats_dir, camera, fo
 
     if os.path.exists(clean_cube_path) and force_rerun == False:
         print("      => LOADING CLEAN CUBE")
-        unsats_data_cube = fits.open(clean_cube_path)[0].data
+        unsats_data_cube = _load_fits_primary_float32(clean_cube_path)
     else:
         print("      => CREATING CLEAN CUBE")
         # 1.0 find files to use (telemetry table stores basenames only)
@@ -73,7 +90,7 @@ def make_clean_cube(file_table_total, redu_dir, obs_path, unsats_dir, camera, fo
         unsat_files = [prefix + str(fn) for fn in used["filename"]]
         # 1.1 pull dark data
         dark_path = used["masterdark_path"][0]
-        dark_data = fits.open(dark_path)[0].data.astype(float)
+        dark_data = _load_fits_primary_float32(dark_path)
         # 1.2 pulling all files and making cube
         unsats_data_cube = fr.make_data_cube(unsat_files, dark_data)
         # 1.3 writing the cube (numpy array — use FITS, not ndarray.write)
@@ -98,19 +115,17 @@ def make_centered_cube(unsats_data_cube, file_table_total, redu_dir, pct_cut, fo
 
     if os.path.exists(centered_cube_path) and force_rerun == False:
         print("      => LOADING CENTERED CUBE")
-        centered_data_cube = fits.open(centered_cube_path)[0].data
-        if not os.path.isfile(centered_file_table_path):
-            raise FileNotFoundError(
-                f"Centered cube exists but missing table: {centered_file_table_path}"
-            )
+        centered_data_cube = _load_fits_primary_float32(centered_cube_path)
         centered_file_table = Table.read(centered_file_table_path, format="ascii.commented_header")
     else:
         print("      => CREATING CENTERED CUBE")
         # 2.0 filter the cube based on max peaks
         max_values, good_idxs = fl.filter_max_value(unsats_data_cube, perc=pct_cut)
         unsats_data_filtered = unsats_data_cube[good_idxs]
+        # Keep DATE_OBS aligned with the clean cube ordering (to_use == 1).
+        td_list = filter_file_table_to_use(file_table_total, use_col="to_use")["DATE_OBS"]
         if save_plot:
-            fl.plot_max_filter_timeseries(max_values, good_idxs, perc=pct_cut, plot_path=redu_dir)
+            fl.plot_max_filter_timeseries(max_values, good_idxs, td_list, perc=pct_cut, plot_path=redu_dir)
             fl.plot_max_filter_hist(max_values, good_idxs, perc=pct_cut, plot_path=redu_dir)
         # 2.1 find the shifts for the remaining frames
         if fit_func == "gauss_min":
@@ -143,15 +158,20 @@ def make_average_image(centered_data_cube, centered_file_table, redu_dir, force_
 
     if os.path.exists(average_image_path) and force_rerun == False:
         print("      => LOADING AVERAGE IMAGE")
-        average_image = fits.open(average_image_path)[0].data
+        average_image = _load_fits_primary_float32(average_image_path)
     else:
         print("      => CREATING AVERAGE IMAGE")
         # 3.0 filter based on the shifts
         shifts = load_shifts(centered_file_table)
         good_idxs = fl.filter_unstat_shifts(shifts, px_max=10)
         centered_data_cube_filtered = centered_data_cube[good_idxs]
-        # 3.1 Average the remaing frames 
-        average_image = np.mean(centered_data_cube_filtered, axis=0)
+        # Grab the timeseries from the centered file table
+        td_list = centered_file_table["DATE_OBS"]
+        if save_plot:
+            fl.plot_shift_filter_timeseries(shifts, good_idxs, td_list, px_max=10, plot_path=redu_dir)
+            fl.plot_max_filter_hist(shifts, good_idxs, px_max=10, plot_path=redu_dir)
+        # 3.1 Average the remaing frames (accumulate in float32)
+        average_image = np.mean(centered_data_cube_filtered, axis=0, dtype=np.float32)
         # 3.1 write the average image
         fits.PrimaryHDU(data=np.asarray(average_image, dtype=np.float32)).writeto(
             average_image_path, overwrite=True
@@ -171,22 +191,27 @@ def find_files(obs_path, unsats_dir, camera="camsci1", max_files=-1):
     print("   Found unsat files: ", len(unsat_files))
     return unsat_files
 
-def find_dark_files(redu_dir, file_table, camera):
+def find_dark_files(dark_search_dir, file_table, camera):
     '''
     Finds unique configuration parameters for the dataset 
     Finds dark files for each configuration
+
+    ``dark_search_dir`` is the root directory searched for ``*masterdark*.fits*``
+    (typically from config ``masterdark_dir``, else ``redu_path``).
     '''
     print("   Finding dark files")
     # These helpers live in filereads.py and call into darks.py as needed.
-    unique_configs = fr.unique_telemetry_configs_for_dark_lookup(file_table, camera=camera)
-    dark_dictionary = fr.lookup_masterdarks_from_telemetry_table(unique_configs, redu_dir=redu_dir, camera=camera)
+    unique_configs = md.unique_telemetry_configs_for_dark_lookup(file_table, camera=camera)
+    dark_dictionary = md.lookup_masterdarks_from_telemetry_table(
+        unique_configs, redu_dir=dark_search_dir, camera=camera
+    )
     # dictionary length will be number of params
     print("   Found ", len(dark_dictionary), " unique configurations for this camera")
     # number of masterdark paths tell us if those 
     for config in dark_dictionary:
         if len(config['masterdark_paths']) == 0:
             print("   WARNING: No master dark found for configuration: ", config)
-    file_table_total = fr.merge_file_table_with_darks(file_table, dark_dictionary)
+    file_table_total = md.merge_file_table_with_darks(file_table, dark_dictionary)
     return file_table_total
     
 def pick_unsat_params(file_table_total):
@@ -325,7 +350,13 @@ def load_shifts(centered_file_table):
 
 ###################### MAIN FUNCTIONS ######################
 
-def preprocess_main(obs_path, unsats_dir, redu_path, camera="camsci1", pct_cut=10, plot=False, max_files=-1, force_rerun=False):
+def preprocess_main(obs_path, unsats_dir, redu_path, camera="camsci1", pct_cut=10, plot=False, max_files=-1, force_rerun=False, masterdark_dir=None):
+    """
+    Run preprocess steps 0–3.
+
+    ``masterdark_dir`` sets where to search for ``*masterdark*.fits`` (recursive).
+    If omitted, ``redu_path`` is used.
+    """
     # specific folder for ther redu dir
     redu_dir = f"{redu_path}{unsats_dir}/{camera}/"
     # if it doesn't already exisct, make it
@@ -333,12 +364,19 @@ def preprocess_main(obs_path, unsats_dir, redu_path, camera="camsci1", pct_cut=1
         os.mkdir(redu_dir)
 
     # STEP 0
-    file_table = find_filetable(redu_dir, obs_path, unsats_dir, camera, max_files, force_rerun)
+    file_table = find_filetable(
+        redu_dir,
+        obs_path,
+        unsats_dir,
+        camera,
+        max_files,
+        redu_path,
+        force_rerun,
+        masterdark_dir=masterdark_dir,
+    )
     
     # STEP 1
-    unsats_data_cube = make_clean_cube(
-        file_table, redu_dir, obs_path, unsats_dir, camera, force_rerun
-    )
+    unsats_data_cube = make_clean_cube(file_table, redu_dir, obs_path, unsats_dir, camera, force_rerun)
 
     # STEP 2
     centered_data_cube, centered_file_table = make_centered_cube(unsats_data_cube, file_table, redu_dir, pct_cut, force_rerun, save_plot=plot, crop_shape=None, fit_func="gauss_min")
@@ -455,6 +493,7 @@ def run_preprocess_from_config(params):
     Validate ``params`` and run :func:`preprocess_main` for each unsats directory and camera.
 
     Optional keys (defaults match :func:`preprocess_main`): ``pct_cut``, ``plot``, ``max_files``.
+    ``masterdark_dir`` (optional): root to search for master dark FITS; defaults to ``redu_path``.
     """
     missing = check_preproc_config(params)
     if missing:
@@ -466,6 +505,7 @@ def run_preprocess_from_config(params):
     pct_cut = params.get("pct_cut", 10)
     plot = params.get("plot", False)
     max_files = params.get("max_files", -1)
+    masterdark_dir = params.get("masterdark_dir")
     for unsats_dir in unsats_dirs:
         for camera in cameras:
             print(f"=> Processing {unsats_dir} {camera}")
@@ -478,6 +518,7 @@ def run_preprocess_from_config(params):
                     pct_cut=pct_cut,
                     plot=plot,
                     max_files=max_files,
+                    masterdark_dir=masterdark_dir,
                 )
             except Exception as e:
                 print(f"Error processing {unsats_dir} {camera}: {e}")

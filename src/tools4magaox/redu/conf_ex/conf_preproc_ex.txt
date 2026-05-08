@@ -3,6 +3,8 @@
 
 obs_path = "/Volumes/magaox_bpic/edenmcewen@arizona.edu/"
 redu_path = "/Volumes/magaox_bpic/redu/"
+# Root directory for recursive search of *masterdark*.fits* (optional; defaults to redu_path)
+masterdark_dir = "/Volumes/magaox_bpic/redu/"
 
 unsats_dir = "2025-12-01_081206_beta_pic_piaa_unsats"
 
