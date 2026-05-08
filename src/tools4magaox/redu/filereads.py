@@ -95,24 +95,28 @@ def write_fits(data, save_path):
 
 # TODO: Make sure the cube isn't too large
 def make_data_avg_cube(file_list, dark_data, n_avg=1, n_files=-1):
+    dark_data = np.asarray(dark_data, dtype=np.float32)
     n_files = len(file_list) if n_files == -1 else n_files
     n_avg_data = n_files // n_avg
-    avg_data = np.zeros((n_avg_data, dark_data.shape[0], dark_data.shape[1]))
+    avg_data = np.zeros((n_avg_data, dark_data.shape[0], dark_data.shape[1]), dtype=np.float32)
     for i in range(n_avg_data):
         #if i % 100 == 0:
         #    print(f"   Processing file {i*n_avg} to {i*n_avg + n_avg} out of {n_files}")
         for j in range(n_avg):
-            demo_data = fits.open(file_list[i+j])[0].data
-            avg_data[i] += demo_data.astype(float) - dark_data
-        avg_data[i] /=n_avg
+            with fits.open(file_list[i * n_avg + j], memmap=False) as hdul:
+                demo_data = hdul[0].data
+            avg_data[i] += np.asarray(demo_data, dtype=np.float32) - dark_data
+        avg_data[i] /= n_avg
     return avg_data
 
 def make_data_cube(file_list, dark_data, n_files=-1):
+    dark_data = np.asarray(dark_data, dtype=np.float32)
     n_files = len(file_list) if n_files == -1 else n_files
-    data_cube = np.zeros((n_files, dark_data.shape[0], dark_data.shape[1]))
+    data_cube = np.zeros((n_files, dark_data.shape[0], dark_data.shape[1]), dtype=np.float32)
     for i in range(n_files):
-        demo_data = fits.open(file_list[i])[0].data
-        data_cube[i] = demo_data.astype(float) - dark_data
+        with fits.open(file_list[i], memmap=False) as hdul:
+            demo_data = hdul[0].data
+        data_cube[i] = np.asarray(demo_data, dtype=np.float32) - dark_data
     return data_cube
 
 # TODO: Make a cube and keep relevant telemetry 
@@ -129,7 +133,7 @@ def make_science_cube(file_list, dark_data, n_files=-1, n_start=0):
     n_files = len(file_list) if n_files > len(file_list) else n_files
     n_files = len(file_list) if n_files == -1 else n_files
     # make an empty data cube 
-    data_cube = np.zeros((n_files, dark_data.shape[0], dark_data.shape[1]))
+    data_cube = np.zeros((n_files, dark_data.shape[0], dark_data.shape[1]), dtype=np.float32)
     parang_cube = np.zeros(n_files)
     time_cube = np.zeros(n_files, dtype='datetime64[us]')
 
@@ -151,7 +155,7 @@ def make_science_cube(file_list, dark_data, n_files=-1, n_start=0):
                 time_stamp = -1
             parang_cube[i] = pg_ang
             time_cube[i] = time_stamp
-            data_cube[i] = test_data
+            data_cube[i] = np.asarray(test_data, dtype=np.float32)
     return data_cube, parang_cube, time_cube
 
 def make_science_cube_coadd(file_list, dark_data, coadd=10, n_files=-1, n_start=0):
@@ -168,8 +172,9 @@ def make_science_cube_coadd(file_list, dark_data, coadd=10, n_files=-1, n_start=
     n_files = len(file_list) if n_files > len(file_list) else n_files
     n_files = len(file_list) if n_files == -1 else n_files
     n_coadd_files = n_files // coadd
+    dark_data = np.asarray(dark_data, dtype=np.float32)
     # make an empty data cube 
-    data_cube = np.zeros((n_coadd_files, dark_data.shape[0], dark_data.shape[1]))
+    data_cube = np.zeros((n_coadd_files, dark_data.shape[0], dark_data.shape[1]), dtype=np.float32)
     parang_cube = np.zeros((n_coadd_files, coadd))
     time_stamp_cube = np.zeros((n_coadd_files, coadd))
 
@@ -177,7 +182,7 @@ def make_science_cube_coadd(file_list, dark_data, coadd=10, n_files=-1, n_start=
         for j in range(coadd):
             fh = fits.open(file_list[n_start+i*coadd+j])
             test_data = fh[0].data
-            data_cube[i] += test_data.astype(float) - dark_data
+            data_cube[i] += np.asarray(test_data, dtype=np.float32) - dark_data
             try:
                 pg_ang = fh[0].header["PARANG"]
                 time_stamp = fh[0].header["DATE-OBS"]
@@ -229,3 +234,45 @@ def _find_hdr_val(hdr, key, camera_tag=None):
             if nk == wanted or nk.startswith(wanted) or wanted in nk:
                 return hdr[k]
     return None
+
+#################### time functions ####################
+
+def _coerce_times_to_datetime64(times):
+    """
+    Convert FITS-style DATE-OBS values (usually ISO-8601 strings) into a
+    numpy datetime64 array so matplotlib plots a true time axis.
+    """
+    arr = np.asarray(times)
+    if arr.size == 0:
+        return arr
+    # If already datetime64, keep it.
+    if np.issubdtype(arr.dtype, np.datetime64):
+        return arr
+    # Decode bytes -> str, and normalize common sentinels.
+    if arr.dtype.kind in ("S", "a"):
+        arr = np.char.decode(arr, "utf-8", errors="ignore")
+    if arr.dtype.kind == "O":
+        arr = np.array(
+            [
+                (x.decode("utf-8", errors="ignore") if isinstance(x, (bytes, bytearray)) else x)
+                for x in arr
+            ],
+            dtype=object,
+        )
+    # Try vectorized parse into datetime64; replace failures with NaT.
+    out = np.full(arr.shape, np.datetime64("NaT"), dtype="datetime64[us]")
+    for i, x in np.ndenumerate(arr):
+        if x is None:
+            continue
+        if isinstance(x, (np.datetime64,)):
+            out[i] = x.astype("datetime64[us]")
+            continue
+        s = str(x).strip()
+        if s in ("", "None", "nan", "NaN", "-1"):
+            continue
+        try:
+            out[i] = np.datetime64(s).astype("datetime64[us]")
+        except Exception:
+            # Leave as NaT if unparseable
+            pass
+    return out
