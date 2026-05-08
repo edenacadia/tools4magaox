@@ -251,8 +251,21 @@ def unique_telemetry_configs_for_dark_lookup(table, camera=None):
     return table_unique(t[keys], keys=keys)
 
 
+def _require_masterdark_search_dir(redu_dir):
+    """Non-empty path root for recursive masterdark glob; no built-in default."""
+    if redu_dir is None:
+        raise ValueError(
+            "redu_dir must be set (root directory to search for *masterdark*.fits*). "
+            "Pass masterdark_dir from the preprocess config or explicit redu_dir=..."
+        )
+    s = os.path.expanduser(os.fspath(redu_dir)).strip()
+    if not s:
+        raise ValueError("redu_dir must be a non-empty path.")
+    return s
+
+
 def lookup_masterdarks_from_telemetry_table(
-    table, redu_dir="/Volumes/magaox_bpic/redu", camera=None
+    table, redu_dir=None, camera=None
 ):
     """
     For each unique detector configuration in ``table``, call
@@ -263,7 +276,9 @@ def lookup_masterdarks_from_telemetry_table(
     table : astropy.table.Table
         From :func:`fits_telemetry_table` or compatible.
     redu_dir : str
-        Passed to :func:`darks.find_masterdark_for_params`.
+        Root directory passed to :func:`darks.find_masterdark_for_params` (search for
+        ``*masterdark*.fits*`` under this path). Required; use e.g. ``masterdark_dir``
+        from preprocess config.
     camera : str, optional
         Used only if ``table`` has no ``camera`` column.
 
@@ -275,6 +290,7 @@ def lookup_masterdarks_from_telemetry_table(
     """
     from darks import find_masterdark_for_params
 
+    redu_dir = _require_masterdark_search_dir(redu_dir)
     uniq = unique_telemetry_configs_for_dark_lookup(table, camera=camera)
     results = []
     for row in uniq:
@@ -378,7 +394,7 @@ def merge_file_table_with_darks(
     ]
     return out
 
-def find_masterdark_for_params(params, camera, redu_dir="/Volumes/magaox_bpic/redu"):
+def find_masterdark_for_params(params, camera, redu_dir=None):
     """
     Search ``redu_dir`` for masterdark FITS whose headers match ``params``.
 
@@ -391,12 +407,14 @@ def find_masterdark_for_params(params, camera, redu_dir="/Volumes/magaox_bpic/re
         Detector id, e.g. ``"camsci1"``.
     redu_dir : str
         Root directory to search (recursive glob for ``*masterdark*.fits*``).
+        Required (no default); set via preprocess ``masterdark_dir`` or pass explicitly.
 
     Returns
     -------
     list of str
         Paths to matching masterdark files (possibly empty).
     """
+    redu_dir = _require_masterdark_search_dir(redu_dir)
     params_pretty = ["{}={}".format(k, params[k]) for k in params]
     print("   ", params_pretty)
     pattern = os.path.join(redu_dir, "**", "*masterdark*.fits*")
@@ -424,7 +442,7 @@ def find_masterdark_for_params(params, camera, redu_dir="/Volumes/magaox_bpic/re
     return matches
 
 
-def find_masterdark_for_file(file_path, camera="camsci1", redu_dir="/Volumes/magaox_bpic/redu"):
+def find_masterdark_for_file(file_path, camera="camsci1", redu_dir=None):
     """
     Given a FITS file (raw dark or otherwise), search redu_dir for a masterdark
     whose encoded header/filename parameters match this file.
@@ -439,11 +457,12 @@ def find_masterdark_for_file(file_path, camera="camsci1", redu_dir="/Volumes/mag
     params = pull_hdr_params(hdr, camera, darks=False)
     return find_masterdark_for_params(params, camera, redu_dir=redu_dir)
 
-def find_masterdark_by_params(naxis1, naxis2, emgain, adc_speed, exptime, redu_dir="/Volumes/magaox_bpic/redu"):
+def find_masterdark_by_params(naxis1, naxis2, emgain, adc_speed, exptime, redu_dir=None):
     """
     Search redu_dir for masterdark files whose filename or header contain the supplied parameters.
     Returns list of matching file paths.
     """
+    redu_dir = _require_masterdark_search_dir(redu_dir)
     pattern = os.path.join(redu_dir, "**", "*masterdark*.fits*")
     candidates = sorted(glob.glob(pattern, recursive=True))
     matches = []
