@@ -9,11 +9,22 @@ from filereads import _coerce_times_to_datetime64
 #################### filter functions ####################
 
 def filter_max_value(unsats_data, perc=10):
-    # filter out the lowes percentile of max values. 
-    max_values = np.max(unsats_data, axis=(1, 2))
-    threshold = np.percentile(max_values, perc)
+    # filter out the lowest percentile of max values (3D cube), or of per-frame
+    # scalars (1D / column vector from a table).
+    arr = np.asarray(unsats_data)
+    if arr.ndim == 1:
+        max_values = arr
+    elif arr.ndim == 2 and arr.shape[1] == 1:
+        max_values = arr.ravel()
+    else:
+        max_values = np.max(unsats_data, axis=(1, 2))
+    finite = np.isfinite(max_values)
+    if not np.any(finite):
+        print(f"   Max filter: no finite values; keeping 0 frames")
+        return max_values, np.array([], dtype=int)
+    threshold = np.percentile(max_values[finite], perc)
     print(f"   Max filter: {perc} percentile value is {threshold}")
-    good_indexes = np.where(max_values >= threshold)[0]
+    good_indexes = np.where(finite & (max_values >= threshold))[0]
     return max_values, good_indexes
 
 def filter_unstat_shifts(shifts, px_max=10, rolling_avg_window=-1):
@@ -32,6 +43,25 @@ def filter_unstat_shifts(shifts, px_max=10, rolling_avg_window=-1):
     return good_indexes
 
 #################### plot functions ####################
+
+def plot_generic_timeseries(values, good_idxs, timeseries_list, plot_path="", plt_title="timeseries", plt_name="generic_filter_timeseries.png"):
+    obs_name =  plot_path.split("/")[-2] + " " + plot_path.split("/")[-3]
+    values = np.asarray(values, dtype=float)
+    g = np.asarray(good_idxs, dtype=int)
+    t = _coerce_times_to_datetime64(timeseries_list)
+    # plot
+    plt.title(f"{plt_title} \n {obs_name}")
+    plt.xlabel("Time")
+    plt.ylabel("Value")
+    plt.plot(t, values, "o", label="discarded frames", alpha=0.1, color="gray")
+    plt.plot(t[g], values[g], "o", label="good frames", alpha=0.5)
+    plt.legend()
+    # save
+    timeseries_file = os.path.join(plot_path, plt_name) if plot_path else plt_name
+    plt.savefig(timeseries_file)
+    plt.close()
+    print(f"    Saved {plt_title} timeseries to {timeseries_file}")
+    return
 
 def plot_max_filter_timeseries(max_values, good_idxs, timeseries_list, perc=10, plot_path="", plt_name="max_filter_timeseries.png"):
     obs_name =  plot_path.split("/")[-2] + " " + plot_path.split("/")[-3]

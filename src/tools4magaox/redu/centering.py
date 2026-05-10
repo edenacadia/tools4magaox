@@ -34,9 +34,25 @@ def gaussian_fit_shifts(data, crop_shape=None, method="minimize"):
         sources_info = _gaussian_fit_curvefit(cube)
     else:
         raise ValueError(f"Invalid method: {method}")
-    sources_list = sources_info['sources']
+    sources_list = sources_info.get("sources", [])
     shifts = _gaussian_xy_shifts(sources_list, cube.shape[1:])
-    return shifts
+
+    # Normalize gaussian fit outputs into a numeric array for downstream logging.
+    # Parameter order is defined by gaussian_2d: (y0, x0, sigma_y, sigma_x, amplitude, offset).
+    params = np.full((len(sources_list), 6), np.nan, dtype=float)
+    for i, p in enumerate(sources_list):
+        try:
+            params[i, :] = np.asarray(p, dtype=float).ravel()[:6]
+        except Exception:
+            pass
+
+    bad = set(sources_info.get("bad_idx") or [])
+    for i in bad:
+        if 0 <= i < params.shape[0]:
+            params[i, :] = np.nan
+
+    sources_info["gauss_params"] = params
+    return shifts, sources_info
 
 def DAO_fit_shifts(data, crop_shape=None):
     '''
@@ -201,9 +217,21 @@ def _gaussian_fit_curvefit(cube):
             amp_guess, 
             offset_guess)
         # optimizing the fit
-        params_opt, _ = scipy.optimize.curve_fit(gaussian_2d, grid, frame.ravel(), p0=params)
-        sources_list.append(params_opt)
-    return {'sources': sources_list}
+        try:
+            params_opt, _ = scipy.optimize.curve_fit(
+                gaussian_2d,
+                grid,
+                frame.ravel(),
+                p0=params,
+                maxfev=10_000,
+            )
+            sources_list.append(params_opt)
+        except Exception:
+            # Common failure: "Optimal parameters not found: Number of calls to function
+            # has reached maxfev". Mark as bad and keep placeholder params.
+            bad_idx.append(i)
+            sources_list.append(np.full(6, np.nan, dtype=float))
+    return {"bad_idx": bad_idx, "sources": sources_list}
 
 def _gaussian_fit_minimize(cube):
     cube = np.asarray(cube)

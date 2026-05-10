@@ -4,8 +4,10 @@
 # running this on a directory will make a master unsats in that directory
 import argparse
 import ast
-import os
 import glob
+import os
+import sys
+import traceback
 from astropy.io import fits
 from astropy.table import Table
 import matplotlib.pyplot as plt
@@ -26,21 +28,6 @@ CENTERED_FILE_TABLE_NAME = "file_table_centered.txt"
 CLEAN_CUBE_NAME = "clean_cube.fits"
 CENTERED_CUBE_NAME = "centered_cube.fits"
 AVERAGE_IMAGE_NAME = "average_image.fits"
-
-
-def _resolve_masterdark_search_dir(redu_path, masterdark_dir):
-    """Directory tree to search for ``*masterdark*.fits*`` (recursive)."""
-    if masterdark_dir is not None:
-        s = os.path.expanduser(os.fspath(masterdark_dir)).strip()
-        if s:
-            return s
-    return os.path.expanduser(os.fspath(redu_path)).strip()
-
-
-def _load_fits_primary_float32(path):
-    """Load primary HDU data as float32 (reduces RAM vs float64 cubes)."""
-    with fits.open(path, memmap=False) as hdul:
-        return np.asarray(hdul[0].data, dtype=np.float32)
 
 
 ############# Main Functions #############
@@ -80,8 +67,7 @@ def make_clean_cube(file_table_total, redu_dir, obs_path, unsats_dir, camera, fo
     clean_cube_path = f"{redu_dir}/{CLEAN_CUBE_NAME}"
 
     if os.path.exists(clean_cube_path) and force_rerun == False:
-        print("      => LOADING CLEAN CUBE")
-        unsats_data_cube = _load_fits_primary_float32(clean_cube_path)
+        print("      => CLEAN CUBE EXISTS, SKIPPING")
     else:
         print("      => CREATING CLEAN CUBE")
         # 1.0 find files to use (telemetry table stores basenames only)
@@ -97,10 +83,10 @@ def make_clean_cube(file_table_total, redu_dir, obs_path, unsats_dir, camera, fo
         fits.PrimaryHDU(data=np.asarray(unsats_data_cube, dtype=np.float32)).writeto(
             clean_cube_path, overwrite=True
         )
-    return unsats_data_cube
+    return clean_cube_path
 
 # STEP 2
-def make_centered_cube(unsats_data_cube, file_table_total, redu_dir, pct_cut, force_rerun=False, save_plot=True, crop_shape=None, fit_func="gauss_min"):
+def make_centered_cube(clean_cube_path, file_table_total, redu_dir, pct_cut, force_rerun=False, save_plot=True, crop_shape=None, fit_func="gauss_min"):
     '''
     Input: total cube of unsats
     Process:
@@ -114,38 +100,54 @@ def make_centered_cube(unsats_data_cube, file_table_total, redu_dir, pct_cut, fo
     centered_file_table_path = f"{redu_dir}/{CENTERED_FILE_TABLE_NAME}"
 
     if os.path.exists(centered_cube_path) and force_rerun == False:
-        print("      => LOADING CENTERED CUBE")
-        centered_data_cube = _load_fits_primary_float32(centered_cube_path)
+        print("      => CENTERED CUBE EXISTS, SKIPPING")
         centered_file_table = Table.read(centered_file_table_path, format="ascii.commented_header")
     else:
         print("      => CREATING CENTERED CUBE")
+        unsats_data_cube = _load_fits_primary_float32(clean_cube_path)
         # 2.0 filter the cube based on max peaks
         max_values, good_idxs = fl.filter_max_value(unsats_data_cube, perc=pct_cut)
-        unsats_data_filtered = unsats_data_cube[good_idxs]
-        # Keep DATE_OBS aligned with the clean cube ordering (to_use == 1).
-        td_list = filter_file_table_to_use(file_table_total, use_col="to_use")["DATE_OBS"]
         if save_plot:
+            # Keep DATE_OBS aligned with the clean cube ordering (to_use == 1).
+            td_list = filter_file_table_to_use(file_table_total, use_col="to_use")["DATE_OBS"]
             fl.plot_max_filter_timeseries(max_values, good_idxs, td_list, perc=pct_cut, plot_path=redu_dir)
             fl.plot_max_filter_hist(max_values, good_idxs, perc=pct_cut, plot_path=redu_dir)
         # 2.1 find the shifts for the remaining frames
         if fit_func == "gauss_min":
-            shifts = ct.gaussian_fit_shifts(unsats_data_filtered, crop_shape=crop_shape, method="minimize")
+            shifts, info_dict = ct.gaussian_fit_shifts(unsats_data_cube[good_idxs], crop_shape=crop_shape, method="minimize")
         elif fit_func == "gauss_curvefit":
-            shifts = ct.gaussian_fit_shifts(unsats_data_filtered, crop_shape=crop_shape, method="curvefit")
+            shifts, info_dict = ct.gaussian_fit_shifts(unsats_data_cube[good_idxs], crop_shape=crop_shape, method="curvefit")
         else:
             raise ValueError(f"Invalid fit function: {fit_func}")
         # 2.3 center frames using the shifts
-        centered_data_cube = ct.shift_cube(unsats_data_filtered, shifts)
+        centered_data_cube = ct.shift_cube(unsats_data_cube[good_idxs], -shifts)
         # 2.4 update/write file table
-        centered_file_table = write_centered_file_table(file_table_total, redu_dir, max_values, good_idxs, shifts)
+        gauss_params = None
+        if isinstance(info_dict, dict):
+            gauss_params = info_dict.get("gauss_params")
+        centered_file_table = write_centered_file_table(
+            file_table_total,
+            redu_dir,
+            max_values,
+            good_idxs,
+            shifts,
+            gauss_params_good=gauss_params,
+        )
         # 2.5 write the centered cube
         fits.PrimaryHDU(data=np.asarray(centered_data_cube, dtype=np.float32)).writeto(
             centered_cube_path, overwrite=True
         )
-    return centered_data_cube, centered_file_table
+    return centered_file_table
 
 # STEP 3
-def make_average_image(centered_data_cube, centered_file_table, redu_dir, force_rerun=False, save_plot=True):
+def make_average_image(
+    centered_file_table,
+    redu_dir,
+    force_rerun=False,
+    save_plot=True,
+    px_max=10,
+    pct_cut=20,
+):
     '''
     Input: centered cube of unsats 
     Process:
@@ -154,22 +156,35 @@ def make_average_image(centered_data_cube, centered_file_table, redu_dir, force_
         3. write the average image, which frames were filtered out
     '''
     print("   3. Making average image")
+    centered_cube_path = f"{redu_dir}/{CENTERED_CUBE_NAME}"
     average_image_path = f"{redu_dir}/{AVERAGE_IMAGE_NAME}"
 
     if os.path.exists(average_image_path) and force_rerun == False:
-        print("      => LOADING AVERAGE IMAGE")
+        print("      => AVERAGE IMAGE EXISTS, SKIPPING")
         average_image = _load_fits_primary_float32(average_image_path)
     else:
         print("      => CREATING AVERAGE IMAGE")
+        centered_data_cube = _load_fits_primary_float32(centered_cube_path)
         # 3.0 filter based on the shifts
         shifts = load_shifts(centered_file_table)
-        good_idxs = fl.filter_unstat_shifts(shifts, px_max=10)
+        good_idxs1 = fl.filter_unstat_shifts(shifts, px_max=px_max)
+        g_amps = load_table_params("gauss_amp", centered_file_table)
+        g_amps_good, good_idxs2 = fl.filter_max_value(g_amps, perc=pct_cut)
+        # filter the data
+        good_idxs = np.intersect1d(good_idxs1, good_idxs2)
+        print("filter idxs:", good_idxs.shape, good_idxs)
         centered_data_cube_filtered = centered_data_cube[good_idxs]
         # Grab the timeseries from the centered file table
-        td_list = centered_file_table["DATE_OBS"]
         if save_plot:
+            # ``load_shifts`` drops rows with non-finite shifts; align DATE_OBS to the same subset
+            sy = np.asarray(centered_file_table["shift_y"], dtype=float)
+            sx = np.asarray(centered_file_table["shift_x"], dtype=float)
+            mask = np.isfinite(sy) & np.isfinite(sx)
+            td_list = centered_file_table["DATE_OBS"][mask]
             fl.plot_shift_filter_timeseries(shifts, good_idxs, td_list, px_max=10, plot_path=redu_dir)
-            fl.plot_max_filter_hist(shifts, good_idxs, px_max=10, plot_path=redu_dir)
+            fl.plot_shift_filter_scatter(shifts, good_idxs, px_max=10, plot_path=redu_dir)
+            # plot the amplitudes 
+            fl.plot_generic_timeseries(g_amps[mask], good_idxs, td_list, plot_path=redu_dir, plt_title="Gaussian fit amplitudes", plt_name="gauss_amp_filter_timeseries.png")
         # 3.1 Average the remaing frames (accumulate in float32)
         average_image = np.mean(centered_data_cube_filtered, axis=0, dtype=np.float32)
         # 3.1 write the average image
@@ -259,6 +274,19 @@ def pick_unsat_params(file_table_total):
     out["to_use"] = mask.astype(int)
     return out
 
+def _resolve_masterdark_search_dir(redu_path, masterdark_dir):
+    """Directory tree to search for ``*masterdark*.fits*`` (recursive)."""
+    if masterdark_dir is not None:
+        s = os.path.expanduser(os.fspath(masterdark_dir)).strip()
+        if s:
+            return s
+    return os.path.expanduser(os.fspath(redu_path)).strip()
+
+
+def _load_fits_primary_float32(path):
+    """Load primary HDU data as float32 (reduces RAM vs float64 cubes)."""
+    with fits.open(path, memmap=False) as hdul:
+        return np.asarray(hdul[0].data, dtype=np.float32)
 
 ###################### STEP 1 helper functions ######################  
 
@@ -280,6 +308,7 @@ def write_centered_file_table(
     max_values,
     good_idxs,
     shifts_yx_good,
+    gauss_params_good=None,
     use_col="to_use"):
     """
     Build the centered metadata table: copy the full file table, keep only rows
@@ -290,6 +319,9 @@ def write_centered_file_table(
     - ``shift_x``, ``shift_y`` — centroid shifts for frames in ``good_idxs``
       (from :func:`centering.gaussian_fit_shifts`: row ``k`` is ``(dx, dy)`` as
       x then y); NaN for frames that failed the max filter
+    - Gaussian fit parameters for frames in ``good_idxs`` (NaN otherwise):
+      ``gauss_x``, ``gauss_y``, ``gauss_sigma_x``, ``gauss_sigma_y``,
+      ``gauss_amp``, ``gauss_offset``.
 
     ``shifts_yx_good`` must have shape ``(len(good_idxs), 2)``; row ``k`` pairs
     with cube index ``good_idxs[k]`` (components are x, y).
@@ -315,20 +347,52 @@ def write_centered_file_table(
             f"shifts_yx_good has {s.shape[0]} rows but good_idxs has {len(g)}"
         )
 
+    gp = None
+    if gauss_params_good is not None:
+        gp = np.asarray(gauss_params_good, dtype=float)
+        if gp.ndim != 2 or gp.shape[1] != 6:
+            raise ValueError(
+                "gauss_params_good must have shape (N, 6): (y0, x0, sigma_y, sigma_x, amp, offset)"
+            )
+        if gp.shape[0] != len(g):
+            raise ValueError(
+                f"gauss_params_good has {gp.shape[0]} rows but good_idxs has {len(g)}"
+            )
+
     in_good = np.zeros(n, dtype=int)
     in_good[g] = 1
     shift_y = np.full(n, np.nan, dtype=float)
     shift_x = np.full(n, np.nan, dtype=float)
+    gauss_y = np.full(n, np.nan, dtype=float)
+    gauss_x = np.full(n, np.nan, dtype=float)
+    gauss_sigma_y = np.full(n, np.nan, dtype=float)
+    gauss_sigma_x = np.full(n, np.nan, dtype=float)
+    gauss_amp = np.full(n, np.nan, dtype=float)
+    gauss_offset = np.full(n, np.nan, dtype=float)
     # ``gaussian_fit_shifts`` returns (dx, dy) as (x, y) — see centering._gaussian_xy_shifts
     for k, idx in enumerate(g):
         shift_x[idx] = s[k, 0]
         shift_y[idx] = s[k, 1]
+        if gp is not None:
+            # params: (y0, x0, sigma_y, sigma_x, amplitude, offset)
+            gauss_y[idx] = gp[k, 0]
+            gauss_x[idx] = gp[k, 1]
+            gauss_sigma_y[idx] = gp[k, 2]
+            gauss_sigma_x[idx] = gp[k, 3]
+            gauss_amp[idx] = gp[k, 4]
+            gauss_offset[idx] = gp[k, 5]
 
     out = ft.copy()
     out["max_value"] = mv
     out["in_good_idxs"] = in_good
     out["shift_y"] = shift_y
     out["shift_x"] = shift_x
+    out["gauss_y"] = gauss_y
+    out["gauss_x"] = gauss_x
+    out["gauss_sigma_y"] = gauss_sigma_y
+    out["gauss_sigma_x"] = gauss_sigma_x
+    out["gauss_amp"] = gauss_amp
+    out["gauss_offset"] = gauss_offset
 
     os.makedirs(redu_dir, exist_ok=True)
     out_path = os.path.join(redu_dir, CENTERED_FILE_TABLE_NAME)
@@ -348,9 +412,30 @@ def load_shifts(centered_file_table):
     mask = np.isfinite(sy) & np.isfinite(sx)
     return np.column_stack([sy[mask], sx[mask]])
 
+def load_table_params(param_col, file_table):
+    """
+    Values of ``param_col`` for rows with finite ``shift_x`` and ``shift_y`` (same rows as
+    :func:`load_shifts`). One entry per centered-cube frame — aligns with ``load_shifts``
+    and indexing ``centered_data_cube[i]``.
+    """
+    param_array = np.asarray(file_table[param_col], dtype=float)
+    return param_array
 ###################### MAIN FUNCTIONS ######################
 
-def preprocess_main(obs_path, unsats_dir, redu_path, camera="camsci1", pct_cut=10, plot=False, max_files=-1, force_rerun=False, masterdark_dir=None):
+def preprocess_main(
+    obs_path,
+    unsats_dir,
+    redu_path,
+    camera="camsci1",
+    pct_cut=10,
+    px_max=5,
+    plot=False,
+    max_files=-1,
+    force_rerun=False,
+    masterdark_dir=None,
+    crop_shape=None,
+    fit_func="gauss_min",
+):
     """
     Run preprocess steps 0–3.
 
@@ -376,13 +461,22 @@ def preprocess_main(obs_path, unsats_dir, redu_path, camera="camsci1", pct_cut=1
     )
     
     # STEP 1
-    unsats_data_cube = make_clean_cube(file_table, redu_dir, obs_path, unsats_dir, camera, force_rerun)
+    clean_cube_path = make_clean_cube(file_table, redu_dir, obs_path, unsats_dir, camera, force_rerun)
 
     # STEP 2
-    centered_data_cube, centered_file_table = make_centered_cube(unsats_data_cube, file_table, redu_dir, pct_cut, force_rerun, save_plot=plot, crop_shape=None, fit_func="gauss_min")
+    centered_file_table = make_centered_cube(
+        clean_cube_path,
+        file_table,
+        redu_dir,
+        pct_cut,
+        force_rerun,
+        save_plot=plot,
+        crop_shape=crop_shape,
+        fit_func=fit_func,
+    )
 
     # STEP 3
-    average_image = make_average_image(centered_data_cube, centered_file_table, redu_dir, force_rerun, save_plot=plot)
+    average_image = make_average_image(centered_file_table, redu_dir, px_max=px_max, pct_cut=pct_cut, force_rerun=force_rerun, save_plot=plot)
 
     # END OF PIPELINE
     return average_image
@@ -494,6 +588,8 @@ def run_preprocess_from_config(params):
 
     Optional keys (defaults match :func:`preprocess_main`): ``pct_cut``, ``plot``, ``max_files``.
     ``masterdark_dir`` (optional): root to search for master dark FITS; defaults to ``redu_path``.
+    ``crop_shape`` or ``crop_size`` (optional): 2-tuple like ``(64, 64)`` used to crop frames
+    before Gaussian fitting in step 2.
     """
     missing = check_preproc_config(params)
     if missing:
@@ -503,9 +599,13 @@ def run_preprocess_from_config(params):
     unsats_dirs = _unsats_dir_list(params)
     cameras = list(params["cameras"])
     pct_cut = params.get("pct_cut", 10)
+    px_max = params.get("px_max", 5)
     plot = params.get("plot", False)
+    fit_func = params.get("fit_func", "gauss_min")
+    force_rerun = params.get("force_rerun", False)
     max_files = params.get("max_files", -1)
     masterdark_dir = params.get("masterdark_dir")
+    crop_shape = params.get("crop_shape", params.get("crop_size"))
     for unsats_dir in unsats_dirs:
         for camera in cameras:
             print(f"=> Processing {unsats_dir} {camera}")
@@ -516,12 +616,22 @@ def run_preprocess_from_config(params):
                     redu_path,
                     camera=camera,
                     pct_cut=pct_cut,
+                    px_max=px_max,
                     plot=plot,
                     max_files=max_files,
                     masterdark_dir=masterdark_dir,
+                    crop_shape=crop_shape,
+                    fit_func=fit_func,
+                    force_rerun=force_rerun,
                 )
             except Exception as e:
-                print(f"Error processing {unsats_dir} {camera}: {e}")
+                print(
+                    f"Error processing {unsats_dir} {camera}: {e}",
+                    file=sys.stderr,
+                )
+                traceback.print_exception(
+                    type(e), e, e.__traceback__, chain=True, file=sys.stderr
+                )
 
 
 def cli_preprocess(argv=None):
@@ -542,7 +652,11 @@ def cli_preprocess(argv=None):
         try:
             run_preprocess_from_config(params)
         except ValueError as e:
-            raise SystemExit(f"{cfg_path}: {e}") from e
+            print(f"{cfg_path}: {e}", file=sys.stderr)
+            traceback.print_exception(
+                type(e), e, e.__traceback__, chain=True, file=sys.stderr
+            )
+            raise SystemExit(1) from e
 
 if __name__ == "__main__":
     # collects args from command line and runs the preprocess pipeline
