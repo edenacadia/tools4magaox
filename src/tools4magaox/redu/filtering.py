@@ -1,10 +1,15 @@
 # filtering.py
 # 2026/04/06
 # these are all the various ways we can filter the data
+import logging
 import os
-import numpy as np
+
 import matplotlib.pyplot as plt
+import numpy as np
+
 from filereads import _coerce_times_to_datetime64
+
+log = logging.getLogger(__name__)
 
 #################### filter functions ####################
 
@@ -20,11 +25,39 @@ def filter_max_value(unsats_data, perc=10):
         max_values = np.max(unsats_data, axis=(1, 2))
     finite = np.isfinite(max_values)
     if not np.any(finite):
-        print(f"        Max filter: no finite values; keeping 0 frames")
-        return max_values, np.array([], dtype=int)
+        log.warning("filter_max_value: no finite values; keeping 0 frames")
+        good_empty = np.array([], dtype=int)
+        log.info(
+            "filter_max_value return: max_values shape=%s dtype=%s good_indexes=%s (empty)",
+            getattr(max_values, "shape", ()), max_values.dtype, good_empty,
+        )
+        return max_values, good_empty
     threshold = np.percentile(max_values[finite], perc)
     good_indexes = np.where(finite & (max_values >= threshold))[0]
-    print(f"        Max filter: {perc} percentile value is {threshold}, {len(good_indexes)}/{len(max_values)} frames kept")
+    log.info(
+        "filter_max_value: perc=%s threshold=%s kept %s/%s frames",
+        perc,
+        threshold,
+        len(good_indexes),
+        len(max_values),
+    )
+    mv_min = float(np.nanmin(max_values[finite]))
+    mv_max = float(np.nanmax(max_values[finite]))
+    idx_lo = int(np.min(good_indexes)) if len(good_indexes) else None
+    idx_hi = int(np.max(good_indexes)) if len(good_indexes) else None
+    log.info(
+        "filter_max_value return: max_values shape=%s dtype=%s finite_min=%s finite_max=%s | "
+        "good_indexes shape=%s dtype=%s count=%s idx_range=[%s,%s]",
+        max_values.shape,
+        max_values.dtype,
+        mv_min,
+        mv_max,
+        good_indexes.shape,
+        good_indexes.dtype,
+        len(good_indexes),
+        idx_lo,
+        idx_hi,
+    )
     return max_values, good_indexes
 
 def filter_unstat_shifts(shifts, px_max=10, rolling_avg_window=-1):
@@ -39,7 +72,23 @@ def filter_unstat_shifts(shifts, px_max=10, rolling_avg_window=-1):
         rolling_avg = np.convolve(shifts_r, np.ones(rolling_avg_window)/rolling_avg_window, mode='valid')
         shifts_from_mean = shifts_r - rolling_avg
     good_indexes = np.where(np.abs(shifts_r) <= px_max)[0]
-    print(f"        Unstat shifts filter: {px_max} px max value, {len(good_indexes)}/{len(shifts)} frames kept")
+    log.info(
+        "filter_unstat_shifts: px_max=%s kept %s/%s frames mean_shift=%s",
+        px_max,
+        len(good_indexes),
+        len(shifts),
+        mean_shift.tolist(),
+    )
+    idx_lo = int(np.min(good_indexes)) if len(good_indexes) else None
+    idx_hi = int(np.max(good_indexes)) if len(good_indexes) else None
+    log.info(
+        "filter_unstat_shifts return: good_indexes shape=%s dtype=%s count=%s idx_range=[%s,%s]",
+        good_indexes.shape,
+        good_indexes.dtype,
+        len(good_indexes),
+        idx_lo,
+        idx_hi,
+    )
     return good_indexes
 
 #################### plot functions ####################
@@ -60,7 +109,7 @@ def plot_generic_timeseries(values, good_idxs, timeseries_list, plot_path="", pl
     timeseries_file = os.path.join(plot_path, plt_name) if plot_path else plt_name
     plt.savefig(timeseries_file)
     plt.close()
-    print(f"        -> Saved {plt_title} timeseries to {timeseries_file}")
+    log.info("Saved %s timeseries to %s", plt_title, timeseries_file)
     return
 
 def plot_max_filter_timeseries(max_values, good_idxs, timeseries_list, perc=10, plot_path="", plt_name="max_filter_timeseries.png"):
@@ -87,7 +136,7 @@ def plot_max_filter_timeseries(max_values, good_idxs, timeseries_list, perc=10, 
     timeseries_file = os.path.join(plot_path, plt_name) if plot_path else plt_name
     plt.savefig(timeseries_file)
     plt.close()
-    print(f"        -> Saved max filter timeseries to {timeseries_file}")
+    log.info("Saved max filter timeseries to %s", timeseries_file)
     return 
 
 def plot_max_filter_hist(max_values, good_idxs, perc=10, plot_path="", plt_name="max_filter_hist.png"):
@@ -108,7 +157,7 @@ def plot_max_filter_hist(max_values, good_idxs, perc=10, plot_path="", plt_name=
     plt.legend()
     plt.savefig(hist_file)
     plt.close()
-    print(f"        -> Saved max filter histogram to {hist_file}")
+    log.info("Saved max filter histogram to %s", hist_file)
     return 
 
 ###########################################################################
@@ -136,7 +185,7 @@ def plot_shift_filter_timeseries(shifts, good_idxs, timeseries_list, px_max=10, 
     timeseries_file = os.path.join(plot_path, plt_name) if plot_path else plt_name
     plt.savefig(timeseries_file)
     plt.close()
-    print(f"        -> Saved shift filter timeseries to {timeseries_file}")
+    log.info("Saved shift filter timeseries to %s", timeseries_file)
     return
 
 def plot_shift_filter_scatter(shifts, good_idxs, px_max=10, plot_path="", plt_name="shift_filter_scatter.png"):
@@ -155,5 +204,5 @@ def plot_shift_filter_scatter(shifts, good_idxs, px_max=10, plot_path="", plt_na
     scatter_file = os.path.join(plot_path, plt_name) if plot_path else plt_name
     plt.savefig(scatter_file)
     plt.close()
-    print(f"        -> Saved shift filter scatter plot to {scatter_file}")
+    log.info("Saved shift filter scatter plot to %s", scatter_file)
     return

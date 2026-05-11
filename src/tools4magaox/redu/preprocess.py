@@ -5,10 +5,10 @@
 import argparse
 import ast
 import glob
+import logging
 import os
 import shutil
 import sys
-import traceback
 from astropy.io import fits
 from astropy.table import Table
 import matplotlib.pyplot as plt
@@ -23,6 +23,8 @@ import filtering as fl
 import filereads as fr
 import centering as ct
 
+log = logging.getLogger(__name__)
+
 # files you should expect this script to make
 FILE_TABLE_NAME = "file_table.txt"
 CENTERED_FILE_TABLE_NAME = "file_table_centered.txt"
@@ -32,6 +34,54 @@ CENTERED_CUBE_NAME = "centered_cube.fits"
 AVERAGE_IMAGE_NAME = "average_image.fits"
 # Copy of the preprocess config saved alongside pipeline outputs (CLI supplies path).
 PREPROCESS_CONFIG_SNAPSHOT_NAME = "preprocess_config.txt"
+PREPROCESS_LOG_NAME = "preprocess.log"
+
+
+def _redu_pkg_logger():
+    """Parent of ``preprocess`` / ``filtering`` so both share one set of handlers."""
+    p = log.parent
+    return p if p.name else log
+
+
+def _ensure_stderr_logging():
+    """Attach a stderr handler on the redu package logger (shared with ``filtering``)."""
+    pkg = _redu_pkg_logger()
+    if pkg.handlers:
+        return
+    sh = logging.StreamHandler(sys.stderr)
+    sh.setFormatter(logging.Formatter("%(levelname)s %(message)s"))
+    pkg.addHandler(sh)
+    pkg.setLevel(logging.INFO)
+    pkg.propagate = False
+    log.propagate = True
+
+
+def _configure_preprocess_logging(redu_dir):
+    """
+    Log to ``{redu_dir}/preprocess.log`` (overwrite each run) and stderr.
+    Same directory as ``PREPROCESS_CONFIG_SNAPSHOT_NAME`` (``preprocess_config.txt``).
+
+    Handlers are attached to the ``tools4magaox.redu`` package logger so sibling modules
+    (e.g. ``filtering``) also write to the same file.
+    """
+    os.makedirs(redu_dir, exist_ok=True)
+    log_path = os.path.join(redu_dir, PREPROCESS_LOG_NAME)
+    fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
+    pkg = _redu_pkg_logger()
+    for h in list(pkg.handlers):
+        pkg.removeHandler(h)
+    for h in list(log.handlers):
+        log.removeHandler(h)
+    fh = logging.FileHandler(log_path, mode="w", encoding="utf-8")
+    fh.setFormatter(fmt)
+    pkg.addHandler(fh)
+    sh = logging.StreamHandler(sys.stderr)
+    sh.setFormatter(fmt)
+    pkg.addHandler(sh)
+    pkg.setLevel(logging.INFO)
+    pkg.propagate = False
+    log.propagate = True
+    log.info("Preprocess log file: %s", log_path)
 
 
 def _copy_preprocess_config_to_redu(config_source_path, redu_dir):
@@ -44,7 +94,7 @@ def _copy_preprocess_config_to_redu(config_source_path, redu_dir):
     os.makedirs(redu_dir, exist_ok=True)
     dst = os.path.join(redu_dir, PREPROCESS_CONFIG_SNAPSHOT_NAME)
     shutil.copy2(src, dst)
-    print(f"      => Saved config snapshot: {dst}")
+    log.info("Saved config snapshot: %s", dst)
 
 
 ############# Main Functions #############
@@ -55,14 +105,14 @@ def find_filetable(redu_dir, obs_path, unsats_dir, camera, max_files, redu_path,
     Checks to see if the table exists in redu_path
     If it doesn't, it's created
     '''
-    print("   0. Finding file table")
+    log.info("0. Finding file table")
     file_table_path = f"{redu_dir}/{FILE_TABLE_NAME}"
 
     if os.path.exists(file_table_path) and force_rerun == False:
-        print("      => LOADING FILE TABLE")
+        log.info("=> LOADING FILE TABLE")
         file_table = Table.read(file_table_path, format="ascii.commented_header")
     else:
-        print("      => CREATING FILE TABLE")
+        log.info("=> CREATING FILE TABLE")
         # 0.0 - file table
         unsat_files = find_files(obs_path, unsats_dir, camera, max_files)
         unsats_table = fr.fits_telemetry_table(unsat_files, camera)
@@ -80,13 +130,13 @@ def make_clean_cube(file_table_total, redu_dir, obs_path, unsats_dir, camera, fo
     '''
     Makes a clean cube from all unsat files in majority param set
     '''
-    print("   1. Making clean cube")
+    log.info("1. Making clean cube")
     clean_cube_path = f"{redu_dir}/{CLEAN_CUBE_NAME}"
 
     if os.path.exists(clean_cube_path) and force_rerun == False:
-        print("      => CLEAN CUBE EXISTS, SKIPPING")
+        log.info("=> CLEAN CUBE EXISTS, SKIPPING")
     else:
-        print("      => CREATING CLEAN CUBE")
+        log.info("=> CREATING CLEAN CUBE")
         # 1.0 find files to use (telemetry table stores basenames only)
         used = file_table_total[file_table_total["to_use"] == 1]
         prefix = f"{obs_path}{unsats_dir}/{camera}/"
@@ -112,15 +162,15 @@ def make_centered_cube(clean_cube_path, file_table_total, redu_dir, pct_cut, for
         3. write the centered cube, 
         4. write which frames were filtered out, shifts for the remaining frames
     '''
-    print("   2. Making centered cube")
+    log.info("2. Making centered cube")
     centered_cube_path = f"{redu_dir}/{CENTERED_CUBE_NAME}"
     centered_file_table_path = f"{redu_dir}/{CENTERED_FILE_TABLE_NAME}"
 
     if os.path.exists(centered_cube_path) and force_rerun == False:
-        print("      => CENTERED CUBE EXISTS, SKIPPING")
+        log.info("=> CENTERED CUBE EXISTS, SKIPPING")
         centered_file_table = Table.read(centered_file_table_path, format="ascii.commented_header")
     else:
-        print("      => CREATING CENTERED CUBE")
+        log.info("=> CREATING CENTERED CUBE")
         unsats_data_cube = _load_fits_primary_float32(clean_cube_path)
         # 2.0 filter the cube based on max peaks
         max_values, good_idxs = fl.filter_max_value(unsats_data_cube, perc=pct_cut)
@@ -174,15 +224,15 @@ def make_average_image(
         4. write ``file_table_average.txt`` — centered table plus ``pass_avg_shift``,
            ``pass_avg_amp``, ``used_in_average`` (see :func:`write_average_file_table`).
     '''
-    print("   3. Making average image")
+    log.info("3. Making average image")
     centered_cube_path = f"{redu_dir}/{CENTERED_CUBE_NAME}"
     average_image_path = f"{redu_dir}/{AVERAGE_IMAGE_NAME}"
 
     if os.path.exists(average_image_path) and force_rerun == False:
-        print("      => AVERAGE IMAGE EXISTS, SKIPPING")
+        log.info("=> AVERAGE IMAGE EXISTS, SKIPPING")
         average_image = _load_fits_primary_float32(average_image_path)
     else:
-        print("      => CREATING AVERAGE IMAGE")
+        log.info("=> CREATING AVERAGE IMAGE")
         centered_data_cube = _load_fits_primary_float32(centered_cube_path)
         # 3.0 filter based on the shifts (indices are centered-cube rows 0..n-1)
         shifts = load_shifts(centered_file_table)
@@ -195,7 +245,11 @@ def make_average_image(
         g_amps_cube = np.asarray(centered_file_table["gauss_amp"], dtype=float)[mask]
         _, good_idxs2 = fl.filter_max_value(g_amps_cube, perc=pct_cut)
         good_idxs = np.intersect1d(good_idxs1, good_idxs2)
-        print(f"        -> {len(good_idxs)} / {len(centered_data_cube)} centered frames kept for average image")
+        log.info(
+            "-> %s / %s centered frames kept for average image",
+            len(good_idxs),
+            len(centered_data_cube),
+        )
         centered_data_cube_filtered = centered_data_cube[good_idxs]
         write_average_file_table(
             centered_file_table,
@@ -232,11 +286,11 @@ def find_files(obs_path, unsats_dir, camera="camsci1", max_files=-1):
     '''
     Take the observation path and unsats directory to find as many files as requested
     '''
-    print("   Finding unsat files")
+    log.info("Finding unsat files")
     unsat_files = glob.glob(f"{obs_path}{unsats_dir}/{camera}/*")
     if max_files > len(unsat_files): max_files = len(unsat_files)
     unsat_files = sorted(unsat_files)[:max_files]
-    print("   Found unsat files: ", len(unsat_files))
+    log.info("Found unsat files: %s", len(unsat_files))
     return unsat_files
 
 def find_dark_files(dark_search_dir, file_table, camera):
@@ -247,18 +301,18 @@ def find_dark_files(dark_search_dir, file_table, camera):
     ``dark_search_dir`` is the root directory searched for ``*masterdark*.fits*``
     (typically from config ``masterdark_dir``, else ``redu_path``).
     '''
-    print("   Finding dark files")
+    log.info("Finding dark files")
     # These helpers live in filereads.py and call into darks.py as needed.
     unique_configs = md.unique_telemetry_configs_for_dark_lookup(file_table, camera=camera)
     dark_dictionary = md.lookup_masterdarks_from_telemetry_table(
         unique_configs, redu_dir=dark_search_dir, camera=camera
     )
     # dictionary length will be number of params
-    print("   Found ", len(dark_dictionary), " unique configurations for this camera")
+    log.info("Found %s unique configurations for this camera", len(dark_dictionary))
     # number of masterdark paths tell us if those 
     for config in dark_dictionary:
         if len(config['masterdark_paths']) == 0:
-            print("     WARNING: No master dark found for configuration: ", config)
+            log.warning("No master dark found for configuration: %s", config)
     file_table_total = md.merge_file_table_with_darks(file_table, dark_dictionary)
     return file_table_total
     
@@ -269,7 +323,7 @@ def pick_unsat_params(file_table_total):
     Adds a column ``to_use`` to the table: 1 if the file is in the majority
     configuration, else 0.
     '''
-    print("   Picking unsat parameters")
+    log.info("Picking unsat parameters")
     cfg_cols = (
         "camera",
         "NAXIS1",
@@ -507,7 +561,7 @@ def write_average_file_table(
     os.makedirs(redu_dir, exist_ok=True)
     out_path = os.path.join(redu_dir, FILE_TABLE_AVERAGE_NAME)
     out.write(out_path, format="ascii.commented_header", overwrite=True)
-    print(f"      => Wrote average-stage table: {out_path}")
+    log.info("Wrote average-stage table: %s", out_path)
     return out
 
 
@@ -542,6 +596,10 @@ def preprocess_main(
     # if it doesn't already exisct, make it
     if not os.path.exists(redu_dir):
         os.mkdir(redu_dir)
+
+    _configure_preprocess_logging(redu_dir)
+    _copy_preprocess_config_to_redu(config_source_path, redu_dir)
+    log.info("=> Processing %s %s (redu_dir=%s)", unsats_dir, camera, redu_dir)
 
     # STEP 0
     file_table = find_filetable(
@@ -706,11 +764,8 @@ def run_preprocess_from_config(params, config_source_path=None):
     masterdark_dir = params.get("masterdark_dir")
     crop_shape = params.get("crop_shape", params.get("crop_size"))
 
-    config_copy_path = f"{redu_path}/{unsats_dirs[0]}"
-    _copy_preprocess_config_to_redu(config_source_path, config_copy_path)
     for unsats_dir in unsats_dirs:
         for camera in cameras:
-            print(f"=> Processing {unsats_dir} {camera}")
             try:
                 preprocess_main(
                     obs_path,
@@ -727,14 +782,8 @@ def run_preprocess_from_config(params, config_source_path=None):
                     force_rerun=force_rerun,
                     config_source_path=config_source_path,
                 )
-            except Exception as e:
-                print(
-                    f"Error processing {unsats_dir} {camera}: {e}",
-                    file=sys.stderr,
-                )
-                traceback.print_exception(
-                    type(e), e, e.__traceback__, chain=True, file=sys.stderr
-                )
+            except Exception:
+                log.exception("Error processing %s %s", unsats_dir, camera)
 
 
 def cli_preprocess(argv=None):
@@ -749,16 +798,14 @@ def cli_preprocess(argv=None):
         help="Preprocess config file(s), e.g. conf_ex/conf_preproc_ex.txt",
     )
     args = parser.parse_args(argv)
+    _ensure_stderr_logging()
     for cfg_path in args.configs:
         params = read_preproc_config(cfg_path)
-        print(f"=> Config: {cfg_path}")
+        log.info("=> Config: %s", cfg_path)
         try:
             run_preprocess_from_config(params, config_source_path=cfg_path)
         except ValueError as e:
-            print(f"{cfg_path}: {e}", file=sys.stderr)
-            traceback.print_exception(
-                type(e), e, e.__traceback__, chain=True, file=sys.stderr
-            )
+            log.exception("%s: %s", cfg_path, e)
             raise SystemExit(1) from e
 
 if __name__ == "__main__":
