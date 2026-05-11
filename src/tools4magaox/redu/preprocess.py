@@ -6,6 +6,7 @@ import argparse
 import ast
 import glob
 import os
+import shutil
 import sys
 import traceback
 from astropy.io import fits
@@ -25,9 +26,25 @@ import centering as ct
 # files you should expect this script to make
 FILE_TABLE_NAME = "file_table.txt"
 CENTERED_FILE_TABLE_NAME = "file_table_centered.txt"
+FILE_TABLE_AVERAGE_NAME = "file_table_average.txt"
 CLEAN_CUBE_NAME = "clean_cube.fits"
 CENTERED_CUBE_NAME = "centered_cube.fits"
 AVERAGE_IMAGE_NAME = "average_image.fits"
+# Copy of the preprocess config saved alongside pipeline outputs (CLI supplies path).
+PREPROCESS_CONFIG_SNAPSHOT_NAME = "preprocess_config.txt"
+
+
+def _copy_preprocess_config_to_redu(config_source_path, redu_dir):
+    """Copy the preprocess config file into ``redu_dir`` for provenance."""
+    if not config_source_path:
+        return
+    src = os.path.abspath(os.fspath(config_source_path))
+    if not os.path.isfile(src):
+        return
+    os.makedirs(redu_dir, exist_ok=True)
+    dst = os.path.join(redu_dir, PREPROCESS_CONFIG_SNAPSHOT_NAME)
+    shutil.copy2(src, dst)
+    print(f"      => Saved config snapshot: {dst}")
 
 
 ############# Main Functions #############
@@ -154,6 +171,8 @@ def make_average_image(
         1. filter based on the shifts
         2. average the remaining frames
         3. write the average image, which frames were filtered out
+        4. write ``file_table_average.txt`` — centered table plus ``pass_avg_shift``,
+           ``pass_avg_amp``, ``used_in_average`` (see :func:`write_average_file_table`).
     '''
     print("   3. Making average image")
     centered_cube_path = f"{redu_dir}/{CENTERED_CUBE_NAME}"
@@ -165,26 +184,40 @@ def make_average_image(
     else:
         print("      => CREATING AVERAGE IMAGE")
         centered_data_cube = _load_fits_primary_float32(centered_cube_path)
-        # 3.0 filter based on the shifts
+        # 3.0 filter based on the shifts (indices are centered-cube rows 0..n-1)
         shifts = load_shifts(centered_file_table)
         good_idxs1 = fl.filter_unstat_shifts(shifts, px_max=px_max)
-        g_amps = load_table_params("gauss_amp", centered_file_table)
-        g_amps_good, good_idxs2 = fl.filter_max_value(g_amps, perc=pct_cut)
-        # filter the data
+        # mask on usable centring shifts
+        sy = np.asarray(centered_file_table["shift_y"], dtype=float)
+        sx = np.asarray(centered_file_table["shift_x"], dtype=float)
+        mask = np.isfinite(sy) & np.isfinite(sx)
+
+        g_amps_cube = np.asarray(centered_file_table["gauss_amp"], dtype=float)[mask]
+        _, good_idxs2 = fl.filter_max_value(g_amps_cube, perc=pct_cut)
         good_idxs = np.intersect1d(good_idxs1, good_idxs2)
-        print("filter idxs:", good_idxs.shape, good_idxs)
+        print(f"        -> {len(good_idxs)} / {len(centered_data_cube)} centered frames kept for average image")
         centered_data_cube_filtered = centered_data_cube[good_idxs]
+        write_average_file_table(
+            centered_file_table,
+            redu_dir,
+            good_idxs1,
+            good_idxs2,
+            good_idxs,
+        )
         # Grab the timeseries from the centered file table
         if save_plot:
-            # ``load_shifts`` drops rows with non-finite shifts; align DATE_OBS to the same subset
-            sy = np.asarray(centered_file_table["shift_y"], dtype=float)
-            sx = np.asarray(centered_file_table["shift_x"], dtype=float)
-            mask = np.isfinite(sy) & np.isfinite(sx)
             td_list = centered_file_table["DATE_OBS"][mask]
             fl.plot_shift_filter_timeseries(shifts, good_idxs, td_list, px_max=10, plot_path=redu_dir)
             fl.plot_shift_filter_scatter(shifts, good_idxs, px_max=10, plot_path=redu_dir)
             # plot the amplitudes 
-            fl.plot_generic_timeseries(g_amps[mask], good_idxs, td_list, plot_path=redu_dir, plt_title="Gaussian fit amplitudes", plt_name="gauss_amp_filter_timeseries.png")
+            fl.plot_generic_timeseries(
+                g_amps_cube,
+                good_idxs,
+                td_list,
+                plot_path=redu_dir,
+                plt_title="Gaussian fit amplitudes",
+                plt_name="gauss_amp_filter_timeseries.png",
+            )
         # 3.1 Average the remaing frames (accumulate in float32)
         average_image = np.mean(centered_data_cube_filtered, axis=0, dtype=np.float32)
         # 3.1 write the average image
@@ -225,7 +258,7 @@ def find_dark_files(dark_search_dir, file_table, camera):
     # number of masterdark paths tell us if those 
     for config in dark_dictionary:
         if len(config['masterdark_paths']) == 0:
-            print("   WARNING: No master dark found for configuration: ", config)
+            print("     WARNING: No master dark found for configuration: ", config)
     file_table_total = md.merge_file_table_with_darks(file_table, dark_dictionary)
     return file_table_total
     
@@ -249,7 +282,7 @@ def pick_unsat_params(file_table_total):
     )
     missing = [c for c in cfg_cols if c not in file_table_total.colnames]
     if missing:
-        raise ValueError(f"file_table_total missing required columns for param picking: {missing}")
+        raise ValueError(f"  file_table_total missing required columns for param picking: {missing}")
 
     # Count how many files fall into each configuration.
     key_rows = file_table_total[list(cfg_cols)]
@@ -420,6 +453,64 @@ def load_table_params(param_col, file_table):
     """
     param_array = np.asarray(file_table[param_col], dtype=float)
     return param_array
+
+
+def write_average_file_table(
+    centered_file_table,
+    redu_dir,
+    good_idxs1,
+    good_idxs2,
+    good_idxs,
+):
+    """
+    Copy the centered metadata table and add per-row flags for step-3 filters (indices are
+    **centered-cube** frame indices ``0 .. n_cube-1``, same as ``centered_cube.fits``).
+
+    New columns (0/1; rows without finite shifts are 0):
+
+    - ``pass_avg_shift`` — frame index in ``good_idxs1`` (unstable-shift filter)
+    - ``pass_avg_amp`` — frame index in ``good_idxs2`` (amplitude / max-value percentile filter)
+    - ``used_in_average`` — frame index in ``good_idxs`` (intersection; frames averaged)
+
+    Writes ``{redu_dir}/{FILE_TABLE_AVERAGE_NAME}``.
+    """
+    sy = np.asarray(centered_file_table["shift_y"], dtype=float)
+    sx = np.asarray(centered_file_table["shift_x"], dtype=float)
+    finite = np.isfinite(sy) & np.isfinite(sx)
+    n_cube = int(np.sum(finite))
+    cube_idx = np.full(len(centered_file_table), -1, dtype=np.int64)
+    cube_idx[finite] = np.arange(n_cube, dtype=np.int64)
+
+    g1 = set(np.asarray(good_idxs1, dtype=int).ravel().tolist())
+    g2 = set(np.asarray(good_idxs2, dtype=int).ravel().tolist())
+    gu = set(np.asarray(good_idxs, dtype=int).ravel().tolist())
+
+    pass_shift = np.zeros(len(centered_file_table), dtype=int)
+    pass_amp = np.zeros(len(centered_file_table), dtype=int)
+    used_avg = np.zeros(len(centered_file_table), dtype=int)
+    for i in range(len(centered_file_table)):
+        ci = int(cube_idx[i])
+        if ci < 0:
+            continue
+        if ci in g1:
+            pass_shift[i] = 1
+        if ci in g2:
+            pass_amp[i] = 1
+        if ci in gu:
+            used_avg[i] = 1
+
+    out = centered_file_table.copy()
+    out["pass_avg_shift"] = pass_shift
+    out["pass_avg_amp"] = pass_amp
+    out["used_in_average"] = used_avg
+
+    os.makedirs(redu_dir, exist_ok=True)
+    out_path = os.path.join(redu_dir, FILE_TABLE_AVERAGE_NAME)
+    out.write(out_path, format="ascii.commented_header", overwrite=True)
+    print(f"      => Wrote average-stage table: {out_path}")
+    return out
+
+
 ###################### MAIN FUNCTIONS ######################
 
 def preprocess_main(
@@ -435,12 +526,16 @@ def preprocess_main(
     masterdark_dir=None,
     crop_shape=None,
     fit_func="gauss_min",
+    config_source_path=None,
 ):
     """
     Run preprocess steps 0–3.
 
     ``masterdark_dir`` sets where to search for ``*masterdark*.fits`` (recursive).
     If omitted, ``redu_path`` is used.
+
+    ``config_source_path``: if set, copy this file to ``redu_dir`` as
+    ``preprocess_config.txt`` (overwrites on each run).
     """
     # specific folder for ther redu dir
     redu_dir = f"{redu_path}{unsats_dir}/{camera}/"
@@ -582,7 +677,7 @@ def _unsats_dir_list(params):
         return [params["unsats_dir"].strip()]
     return []
 
-def run_preprocess_from_config(params):
+def run_preprocess_from_config(params, config_source_path=None):
     """
     Validate ``params`` and run :func:`preprocess_main` for each unsats directory and camera.
 
@@ -590,10 +685,14 @@ def run_preprocess_from_config(params):
     ``masterdark_dir`` (optional): root to search for master dark FITS; defaults to ``redu_path``.
     ``crop_shape`` or ``crop_size`` (optional): 2-tuple like ``(64, 64)`` used to crop frames
     before Gaussian fitting in step 2.
+
+    ``config_source_path`` (optional): path to the config file on disk; copied into each
+    ``{redu_path}{unsats_dir}/{camera}/`` as ``preprocess_config.txt``.
     """
     missing = check_preproc_config(params)
     if missing:
         raise ValueError(f"config missing or invalid keys: {missing}")
+    #TODO: maybe just pass all the params into preprocess_main instead of having individuals
     obs_path = params["obs_path"]
     redu_path = params["redu_path"]
     unsats_dirs = _unsats_dir_list(params)
@@ -606,6 +705,9 @@ def run_preprocess_from_config(params):
     max_files = params.get("max_files", -1)
     masterdark_dir = params.get("masterdark_dir")
     crop_shape = params.get("crop_shape", params.get("crop_size"))
+
+    config_copy_path = f"{redu_path}/{unsats_dirs[0]}"
+    _copy_preprocess_config_to_redu(config_source_path, config_copy_path)
     for unsats_dir in unsats_dirs:
         for camera in cameras:
             print(f"=> Processing {unsats_dir} {camera}")
@@ -623,6 +725,7 @@ def run_preprocess_from_config(params):
                     crop_shape=crop_shape,
                     fit_func=fit_func,
                     force_rerun=force_rerun,
+                    config_source_path=config_source_path,
                 )
             except Exception as e:
                 print(
@@ -650,7 +753,7 @@ def cli_preprocess(argv=None):
         params = read_preproc_config(cfg_path)
         print(f"=> Config: {cfg_path}")
         try:
-            run_preprocess_from_config(params)
+            run_preprocess_from_config(params, config_source_path=cfg_path)
         except ValueError as e:
             print(f"{cfg_path}: {e}", file=sys.stderr)
             traceback.print_exception(

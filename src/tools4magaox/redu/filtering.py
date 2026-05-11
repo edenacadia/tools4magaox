@@ -20,11 +20,11 @@ def filter_max_value(unsats_data, perc=10):
         max_values = np.max(unsats_data, axis=(1, 2))
     finite = np.isfinite(max_values)
     if not np.any(finite):
-        print(f"   Max filter: no finite values; keeping 0 frames")
+        print(f"        Max filter: no finite values; keeping 0 frames")
         return max_values, np.array([], dtype=int)
     threshold = np.percentile(max_values[finite], perc)
-    print(f"   Max filter: {perc} percentile value is {threshold}")
     good_indexes = np.where(finite & (max_values >= threshold))[0]
+    print(f"        Max filter: {perc} percentile value is {threshold}, {len(good_indexes)}/{len(max_values)} frames kept")
     return max_values, good_indexes
 
 def filter_unstat_shifts(shifts, px_max=10, rolling_avg_window=-1):
@@ -39,7 +39,7 @@ def filter_unstat_shifts(shifts, px_max=10, rolling_avg_window=-1):
         rolling_avg = np.convolve(shifts_r, np.ones(rolling_avg_window)/rolling_avg_window, mode='valid')
         shifts_from_mean = shifts_r - rolling_avg
     good_indexes = np.where(np.abs(shifts_r) <= px_max)[0]
-    print(f"   Unstat shifts filter: {px_max} px max value is {len(good_indexes)}/{len(shifts)}")
+    print(f"        Unstat shifts filter: {px_max} px max value, {len(good_indexes)}/{len(shifts)} frames kept")
     return good_indexes
 
 #################### plot functions ####################
@@ -53,14 +53,14 @@ def plot_generic_timeseries(values, good_idxs, timeseries_list, plot_path="", pl
     plt.title(f"{plt_title} \n {obs_name}")
     plt.xlabel("Time")
     plt.ylabel("Value")
-    plt.plot(t, values, "o", label="discarded frames", alpha=0.1, color="gray")
-    plt.plot(t[g], values[g], "o", label="good frames", alpha=0.5)
+    plt.plot(t, values, "o", label="discarded frames", alpha=0.1, color="gray", markersize=4)
+    plt.plot(t[g], values[g], "o",label="good frames", alpha=0.5, markersize=4)
     plt.legend()
     # save
     timeseries_file = os.path.join(plot_path, plt_name) if plot_path else plt_name
     plt.savefig(timeseries_file)
     plt.close()
-    print(f"    Saved {plt_title} timeseries to {timeseries_file}")
+    print(f"        -> Saved {plt_title} timeseries to {timeseries_file}")
     return
 
 def plot_max_filter_timeseries(max_values, good_idxs, timeseries_list, perc=10, plot_path="", plt_name="max_filter_timeseries.png"):
@@ -79,15 +79,15 @@ def plot_max_filter_timeseries(max_values, good_idxs, timeseries_list, perc=10, 
     plt.title(f"Peak Max filtered timeseries \n {obs_name}")
     plt.xlabel("Time")
     plt.ylabel("Max value")
-    plt.plot(t, max_values, "o", label="discarded frames", alpha=0.1, color="gray")
-    plt.plot(t[g], max_values[g], "o", label="good frames", alpha=0.5)
+    plt.plot(t, max_values, "o", label="discarded frames", alpha=0.1, color="gray", markersize=4)
+    plt.plot(t[g], max_values[g], "o", label="good frames", alpha=0.5, markersize=4)
     plt.axhline(threshold, label=f"{threshold}, {perc}pct", c="r")
     plt.legend()
     # save
     timeseries_file = os.path.join(plot_path, plt_name) if plot_path else plt_name
     plt.savefig(timeseries_file)
     plt.close()
-    print(f"    Saved max filter timeseries to {timeseries_file}")
+    print(f"        -> Saved max filter timeseries to {timeseries_file}")
     return 
 
 def plot_max_filter_hist(max_values, good_idxs, perc=10, plot_path="", plt_name="max_filter_hist.png"):
@@ -108,7 +108,7 @@ def plot_max_filter_hist(max_values, good_idxs, perc=10, plot_path="", plt_name=
     plt.legend()
     plt.savefig(hist_file)
     plt.close()
-    print(f"    Saved max filter histogram to {hist_file}")
+    print(f"        -> Saved max filter histogram to {hist_file}")
     return 
 
 ###########################################################################
@@ -127,16 +127,16 @@ def plot_shift_filter_timeseries(shifts, good_idxs, timeseries_list, px_max=10, 
     plt.title(f"Unstat shifts filtered timeseries \n {obs_name}")
     plt.xlabel("Time")
     plt.ylabel("Shift")
-    plt.plot(t, shifts[:, 0], "o", alpha=0.1, color="gray")
-    plt.plot(t, shifts[:, 1], "o", alpha=0.1, color="gray")
-    plt.plot(t[g], shifts[g, 0], "o", label="y shift", alpha=0.5)
-    plt.plot(t[g], shifts[g, 1], "o", label="x shift", alpha=0.5)
+    plt.plot(t, shifts[:, 0], "o", alpha=0.1, color="gray", markersize=4)
+    plt.plot(t, shifts[:, 1], "o", alpha=0.1, color="gray", markersize=4)
+    plt.plot(t[g], shifts[g, 0], "o", label="y shift", alpha=0.5, markersize=4)
+    plt.plot(t[g], shifts[g, 1], "o", label="x shift", alpha=0.5, markersize=4)
     plt.legend()
     # save
     timeseries_file = os.path.join(plot_path, plt_name) if plot_path else plt_name
     plt.savefig(timeseries_file)
     plt.close()
-    print(f"    Saved shift filter timeseries to {timeseries_file}")
+    print(f"        -> Saved shift filter timeseries to {timeseries_file}")
     return
 
 def plot_shift_filter_scatter(shifts, good_idxs, px_max=10, plot_path="", plt_name="shift_filter_scatter.png"):
@@ -155,5 +155,5 @@ def plot_shift_filter_scatter(shifts, good_idxs, px_max=10, plot_path="", plt_na
     scatter_file = os.path.join(plot_path, plt_name) if plot_path else plt_name
     plt.savefig(scatter_file)
     plt.close()
-    print(f"    Saved shift filter scatter plot to {scatter_file}")
+    print(f"        -> Saved shift filter scatter plot to {scatter_file}")
     return
