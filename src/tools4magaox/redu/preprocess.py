@@ -186,16 +186,12 @@ def make_centered_cube(run_params, clean_cube_path, file_table_static, file_tabl
         gauss_params = None
         if isinstance(info_dict, dict):
             gauss_params = info_dict.get("gauss_params")
-        _update_file_table_output_step2(
-            file_table_output,
-            max_values,
+        _update_file_table_output_step2(file_table_output,max_values,
             good_idxs,
             shifts,
             gauss_params,
         )
-        _write_redu_table(
-            file_table_output, os.path.join(redu_dir, FILE_TABLE_OUTPUT_NAME)
-        )
+        _write_redu_table(file_table_output, os.path.join(redu_dir, FILE_TABLE_OUTPUT_NAME))
         centered_file_table = _filter_file_table_output_for_centering(
             file_table_output
         )
@@ -217,13 +213,13 @@ def make_average_image(run_params, centered_file_table, file_table_static, file_
            and ``used_in_average``.
 
     Reads from ``run_params``: ``redu_dir``, ``force_rerun``, ``plot``, ``px_max``,
-    ``pct_cut`` (used for the Gaussian-amplitude percentile filter in this step).
+    ``gauss_amp_pct_cut`` (used for the Gaussian-amplitude percentile filter in this step).
     '''
     redu_dir = run_params["redu_dir"]
     force_rerun = run_params["force_rerun"]
     save_plot = run_params["plot"]
     px_max = run_params["px_max"]
-    pct_cut = run_params["pct_cut"]
+    gauss_amp_pct_cut = run_params["gauss_amp_pct_cut"]
 
     log.info("3. Making average image")
     centered_cube_path = os.path.join(redu_dir, CENTERED_CUBE_NAME)
@@ -244,7 +240,7 @@ def make_average_image(run_params, centered_file_table, file_table_static, file_
         mask = np.isfinite(sy) & np.isfinite(sx)
 
         g_amps_cube = np.asarray(centered_file_table["gauss_amp"], dtype=float)[mask]
-        _, good_idxs2 = fl.filter_max_value(g_amps_cube, perc=pct_cut)
+        _, good_idxs2 = fl.filter_max_value(g_amps_cube, perc=gauss_amp_pct_cut)
         good_idxs = np.intersect1d(good_idxs1, good_idxs2)
         log.info(
             "-> %s / %s centered frames kept for average image",
@@ -271,7 +267,7 @@ def make_average_image(run_params, centered_file_table, file_table_static, file_
                 td_list,
                 plot_path=redu_dir,
                 plt_title="Gaussian fit amplitudes",
-                plt_name="gauss_amp_filter_timeseries.png",
+                plt_name="3_gauss_amp_filter_timeseries.png",
             )
         # 3.1 Average the remaing frames (accumulate in float32)
         average_image = np.mean(centered_data_cube_filtered, axis=0, dtype=np.float32)
@@ -596,8 +592,9 @@ def build_preprocess_run_params(
     Required in ``params``: ``obs_path``, ``redu_path`` (and typically ``cameras`` at
     config level; ``camera`` here overrides the per-run value).
 
-    Sets defaults: ``pct_cut``, ``px_max``, ``plot``, ``max_files``, ``force_rerun``,
-    ``fit_func``, ``crop_shape`` (from ``crop_size`` if needed), ``masterdark_dir``.
+    Sets defaults: ``pct_cut``, ``gauss_amp_pct_cut``, ``px_max``, ``plot``,
+    ``max_files``, ``force_rerun``, ``fit_func``, ``crop_shape`` (from ``crop_size``
+    if needed), ``masterdark_dir``.
     Adds ``unsats_dir``, ``camera``, ``redu_dir``, and optionally ``config_source_path``.
     """
     p = dict(params)
@@ -605,6 +602,7 @@ def build_preprocess_run_params(
     p["camera"] = camera
     p["redu_dir"] = f"{p['redu_path']}{p['unsats_dir']}/{p['camera']}/"
     p.setdefault("pct_cut", 10)
+    p.setdefault("gauss_amp_pct_cut", p["pct_cut"])
     p.setdefault("px_max", 5)
     p.setdefault("plot", False)
     p.setdefault("max_files", -1)
@@ -832,8 +830,9 @@ def run_preprocess_from_config(params, config_source_path=None):
     For each run, builds a per-camera dict with :func:`build_preprocess_run_params` and passes
     it to :func:`preprocess_main`; step functions read the keys they need from that dict.
 
-    Optional keys in ``params`` (defaults in :func:`build_preprocess_run_params`): ``pct_cut``,
-    ``px_max``, ``plot``, ``max_files``, ``force_rerun``, ``fit_func``.
+    Optional keys in ``params`` (defaults in :func:`build_preprocess_run_params`):
+    ``pct_cut``, ``gauss_amp_pct_cut``, ``px_max``, ``plot``, ``max_files``,
+    ``force_rerun``, ``fit_func``.
     ``masterdark_dir`` (optional): root to search for master dark FITS; defaults to ``redu_path``.
     ``crop_shape`` or ``crop_size`` (optional): 2-tuple like ``(64, 64)`` for step-2 cropping.
 

@@ -112,7 +112,7 @@ def plot_generic_timeseries(values, good_idxs, timeseries_list, plot_path="", pl
     log.info("Saved %s timeseries to %s", plt_title, timeseries_file)
     return
 
-def plot_max_filter_timeseries(max_values, good_idxs, timeseries_list, perc=10, plot_path="", plt_name="max_filter_timeseries.png"):
+def plot_max_filter_timeseries(max_values, good_idxs, timeseries_list, perc=10, plot_path="", plt_name="2_max_filter_timeseries.png"):
     obs_name =  plot_path.split("/")[-2] + " " + plot_path.split("/")[-3]
     # TODO: this is repetative
     max_values = np.asarray(max_values, dtype=float)
@@ -139,7 +139,7 @@ def plot_max_filter_timeseries(max_values, good_idxs, timeseries_list, perc=10, 
     log.info("Saved max filter timeseries to %s", timeseries_file)
     return 
 
-def plot_max_filter_hist(max_values, good_idxs, perc=10, plot_path="", plt_name="max_filter_hist.png"):
+def plot_max_filter_hist(max_values, good_idxs, perc=10, plot_path="", plt_name="2_max_filter_hist.png"):
     hist_file = os.path.join(plot_path, plt_name) if plot_path else plt_name
     obs_name =  plot_path.split("/")[-2] + " " + plot_path.split("/")[-3]
     # TODO: fix, a little repetative
@@ -162,7 +162,7 @@ def plot_max_filter_hist(max_values, good_idxs, perc=10, plot_path="", plt_name=
 
 ###########################################################################
 
-def plot_shift_filter_timeseries(shifts, good_idxs, timeseries_list, px_max=10, plot_path="", plt_name="shift_filter_timeseries.png"):
+def plot_shift_filter_timeseries(shifts, good_idxs, timeseries_list, px_max=10, plot_path="", plt_name="3_shift_filter_timeseries.png"):
     obs_name =  plot_path.split("/")[-2] + " " + plot_path.split("/")[-3]
     shifts = np.asarray(shifts, dtype=float)
     g = np.asarray(good_idxs, dtype=int)
@@ -188,7 +188,7 @@ def plot_shift_filter_timeseries(shifts, good_idxs, timeseries_list, px_max=10, 
     log.info("Saved shift filter timeseries to %s", timeseries_file)
     return
 
-def plot_shift_filter_scatter(shifts, good_idxs, px_max=10, plot_path="", plt_name="shift_filter_scatter.png"):
+def plot_shift_filter_scatter(shifts, good_idxs, px_max=10, plot_path="", plt_name="3_shift_filter_scatter.png"):
     obs_name =  plot_path.split("/")[-2] + " " + plot_path.split("/")[-3]
     # TODO: fix, a little repetative
     shifts = np.asarray(shifts, dtype=float)
