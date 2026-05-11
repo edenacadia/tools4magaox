@@ -224,6 +224,8 @@ def _gaussian_fit_curvefit(cube):
                 frame.ravel(),
                 p0=params,
                 maxfev=10_000,
+                bounds = ((grid.ny*0.2, grid.nx*0.2, 1, 1, 0.5*amp_guess, -0.1*offset_guess),
+                        (grid.ny*0.8, grid.nx*0.8, grid.ny/2, grid.nx/2, 1.5*amp_guess, 2*offset_guess))
             )
             sources_list.append(params_opt)
         except Exception:
