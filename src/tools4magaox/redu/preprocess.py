@@ -37,74 +37,26 @@ PREPROCESS_CONFIG_SNAPSHOT_NAME = "preprocess_config.txt"
 PREPROCESS_LOG_NAME = "preprocess.log"
 
 
-def _redu_pkg_logger():
-    """Parent of ``preprocess`` / ``filtering`` so both share one set of handlers."""
-    p = log.parent
-    return p if p.name else log
-
-
-def _ensure_stderr_logging():
-    """Attach a stderr handler on the redu package logger (shared with ``filtering``)."""
-    pkg = _redu_pkg_logger()
-    if pkg.handlers:
-        return
-    sh = logging.StreamHandler(sys.stderr)
-    sh.setFormatter(logging.Formatter("%(levelname)s %(message)s"))
-    pkg.addHandler(sh)
-    pkg.setLevel(logging.INFO)
-    pkg.propagate = False
-    log.propagate = True
-
-
-def _configure_preprocess_logging(redu_dir):
-    """
-    Log to ``{redu_dir}/preprocess.log`` (overwrite each run) and stderr.
-    Same directory as ``PREPROCESS_CONFIG_SNAPSHOT_NAME`` (``preprocess_config.txt``).
-
-    Handlers are attached to the ``tools4magaox.redu`` package logger so sibling modules
-    (e.g. ``filtering``) also write to the same file.
-    """
-    os.makedirs(redu_dir, exist_ok=True)
-    log_path = os.path.join(redu_dir, PREPROCESS_LOG_NAME)
-    fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
-    pkg = _redu_pkg_logger()
-    for h in list(pkg.handlers):
-        pkg.removeHandler(h)
-    for h in list(log.handlers):
-        log.removeHandler(h)
-    fh = logging.FileHandler(log_path, mode="w", encoding="utf-8")
-    fh.setFormatter(fmt)
-    pkg.addHandler(fh)
-    sh = logging.StreamHandler(sys.stderr)
-    sh.setFormatter(fmt)
-    pkg.addHandler(sh)
-    pkg.setLevel(logging.INFO)
-    pkg.propagate = False
-    log.propagate = True
-    log.info("Preprocess log file: %s", log_path)
-
-
-def _copy_preprocess_config_to_redu(config_source_path, redu_dir):
-    """Copy the preprocess config file into ``redu_dir`` for provenance."""
-    if not config_source_path:
-        return
-    src = os.path.abspath(os.fspath(config_source_path))
-    if not os.path.isfile(src):
-        return
-    os.makedirs(redu_dir, exist_ok=True)
-    dst = os.path.join(redu_dir, PREPROCESS_CONFIG_SNAPSHOT_NAME)
-    shutil.copy2(src, dst)
-    log.info("Saved config snapshot: %s", dst)
-
-
 ############# Main Functions #############
 
 # STEP 0
-def find_filetable(redu_dir, obs_path, unsats_dir, camera, max_files, redu_path, force_rerun=False, masterdark_dir=None):
+def find_filetable(run_params):
     '''
     Checks to see if the table exists in redu_path
     If it doesn't, it's created
+
+    Reads from ``run_params``: ``redu_dir``, ``obs_path``, ``unsats_dir``, ``camera``,
+    ``max_files``, ``redu_path``, ``force_rerun``, ``masterdark_dir``.
     '''
+    redu_dir = run_params["redu_dir"]
+    obs_path = run_params["obs_path"]
+    unsats_dir = run_params["unsats_dir"]
+    camera = run_params["camera"]
+    max_files = run_params["max_files"]
+    redu_path = run_params["redu_path"]
+    force_rerun = run_params["force_rerun"]
+    masterdark_dir = run_params.get("masterdark_dir")
+
     log.info("0. Finding file table")
     file_table_path = f"{redu_dir}/{FILE_TABLE_NAME}"
 
@@ -126,10 +78,19 @@ def find_filetable(redu_dir, obs_path, unsats_dir, camera, max_files, redu_path,
     return file_table
 
 # STEP 1
-def make_clean_cube(file_table_total, redu_dir, obs_path, unsats_dir, camera, force_rerun=False):
+def make_clean_cube(run_params, file_table_total):
     '''
     Makes a clean cube from all unsat files in majority param set
+
+    Reads from ``run_params``: ``redu_dir``, ``obs_path``, ``unsats_dir``, ``camera``,
+    ``force_rerun``.
     '''
+    redu_dir = run_params["redu_dir"]
+    obs_path = run_params["obs_path"]
+    unsats_dir = run_params["unsats_dir"]
+    camera = run_params["camera"]
+    force_rerun = run_params["force_rerun"]
+
     log.info("1. Making clean cube")
     clean_cube_path = f"{redu_dir}/{CLEAN_CUBE_NAME}"
 
@@ -153,7 +114,7 @@ def make_clean_cube(file_table_total, redu_dir, obs_path, unsats_dir, camera, fo
     return clean_cube_path
 
 # STEP 2
-def make_centered_cube(clean_cube_path, file_table_total, redu_dir, pct_cut, force_rerun=False, save_plot=True, crop_shape=None, fit_func="gauss_min"):
+def make_centered_cube(run_params, clean_cube_path, file_table_total):
     '''
     Input: total cube of unsats
     Process:
@@ -161,7 +122,17 @@ def make_centered_cube(clean_cube_path, file_table_total, redu_dir, pct_cut, for
         2. center the remaining frames
         3. write the centered cube, 
         4. write which frames were filtered out, shifts for the remaining frames
+
+    Reads from ``run_params``: ``redu_dir``, ``pct_cut``, ``force_rerun``, ``plot``,
+    ``crop_shape``, ``fit_func``.
     '''
+    redu_dir = run_params["redu_dir"]
+    pct_cut = run_params["pct_cut"]
+    force_rerun = run_params["force_rerun"]
+    save_plot = run_params["plot"]
+    crop_shape = run_params.get("crop_shape")
+    fit_func = run_params["fit_func"]
+
     log.info("2. Making centered cube")
     centered_cube_path = f"{redu_dir}/{CENTERED_CUBE_NAME}"
     centered_file_table_path = f"{redu_dir}/{CENTERED_FILE_TABLE_NAME}"
@@ -207,14 +178,7 @@ def make_centered_cube(clean_cube_path, file_table_total, redu_dir, pct_cut, for
     return centered_file_table
 
 # STEP 3
-def make_average_image(
-    centered_file_table,
-    redu_dir,
-    force_rerun=False,
-    save_plot=True,
-    px_max=10,
-    pct_cut=20,
-):
+def make_average_image(run_params, centered_file_table):
     '''
     Input: centered cube of unsats 
     Process:
@@ -223,7 +187,16 @@ def make_average_image(
         3. write the average image, which frames were filtered out
         4. write ``file_table_average.txt`` — centered table plus ``pass_avg_shift``,
            ``pass_avg_amp``, ``used_in_average`` (see :func:`write_average_file_table`).
+
+    Reads from ``run_params``: ``redu_dir``, ``force_rerun``, ``plot``, ``px_max``,
+    ``pct_cut`` (used for the Gaussian-amplitude percentile filter in this step).
     '''
+    redu_dir = run_params["redu_dir"]
+    force_rerun = run_params["force_rerun"]
+    save_plot = run_params["plot"]
+    px_max = run_params["px_max"]
+    pct_cut = run_params["pct_cut"]
+
     log.info("3. Making average image")
     centered_cube_path = f"{redu_dir}/{CENTERED_CUBE_NAME}"
     average_image_path = f"{redu_dir}/{AVERAGE_IMAGE_NAME}"
@@ -261,8 +234,8 @@ def make_average_image(
         # Grab the timeseries from the centered file table
         if save_plot:
             td_list = centered_file_table["DATE_OBS"][mask]
-            fl.plot_shift_filter_timeseries(shifts, good_idxs, td_list, px_max=10, plot_path=redu_dir)
-            fl.plot_shift_filter_scatter(shifts, good_idxs, px_max=10, plot_path=redu_dir)
+            fl.plot_shift_filter_timeseries(shifts, good_idxs, td_list, px_max=px_max, plot_path=redu_dir)
+            fl.plot_shift_filter_scatter(shifts, good_idxs, px_max=px_max, plot_path=redu_dir)
             # plot the amplitudes 
             fl.plot_generic_timeseries(
                 g_amps_cube,
@@ -567,74 +540,139 @@ def write_average_file_table(
 
 ###################### MAIN FUNCTIONS ######################
 
-def preprocess_main(
-    obs_path,
+def build_preprocess_run_params(
+    params,
     unsats_dir,
-    redu_path,
-    camera="camsci1",
-    pct_cut=10,
-    px_max=5,
-    plot=False,
-    max_files=-1,
-    force_rerun=False,
-    masterdark_dir=None,
-    crop_shape=None,
-    fit_func="gauss_min",
+    camera,
+    *,
     config_source_path=None,
 ):
     """
+    Shallow copy of config ``params`` plus per-run keys. Each pipeline step reads only
+    the keys it needs from the returned dict.
+
+    Required in ``params``: ``obs_path``, ``redu_path`` (and typically ``cameras`` at
+    config level; ``camera`` here overrides the per-run value).
+
+    Sets defaults: ``pct_cut``, ``px_max``, ``plot``, ``max_files``, ``force_rerun``,
+    ``fit_func``, ``crop_shape`` (from ``crop_size`` if needed), ``masterdark_dir``.
+    Adds ``unsats_dir``, ``camera``, ``redu_dir``, and optionally ``config_source_path``.
+    """
+    p = dict(params)
+    p["unsats_dir"] = unsats_dir.strip() if isinstance(unsats_dir, str) else unsats_dir
+    p["camera"] = camera
+    p["redu_dir"] = f"{p['redu_path']}{p['unsats_dir']}/{p['camera']}/"
+    p.setdefault("pct_cut", 10)
+    p.setdefault("px_max", 5)
+    p.setdefault("plot", False)
+    p.setdefault("max_files", -1)
+    p.setdefault("force_rerun", False)
+    p.setdefault("fit_func", "gauss_min")
+    if "crop_shape" not in p and p.get("crop_size") is not None:
+        p["crop_shape"] = p["crop_size"]
+    p.setdefault("crop_shape", None)
+    if config_source_path is not None:
+        p["config_source_path"] = config_source_path
+    return p
+
+
+def preprocess_main(run_params):
+    """
     Run preprocess steps 0–3.
 
-    ``masterdark_dir`` sets where to search for ``*masterdark*.fits`` (recursive).
-    If omitted, ``redu_path`` is used.
+    Parameters
+    ----------
+    run_params : dict
+        Built with :func:`build_preprocess_run_params`. Must include ``redu_dir``,
+        ``obs_path``, ``redu_path``, ``unsats_dir``, ``camera``, and the keys each step
+        reads (see ``find_filetable``, ``make_clean_cube``, ``make_centered_cube``,
+        ``make_average_image``).
 
-    ``config_source_path``: if set, copy this file to ``redu_dir`` as
-    ``preprocess_config.txt`` (overwrites on each run).
+    ``masterdark_dir`` in ``run_params`` sets where to search for ``*masterdark*.fits``.
+    ``config_source_path`` in ``run_params``: if set, copy to ``redu_dir`` as
+    ``preprocess_config.txt``.
     """
-    # specific folder for ther redu dir
-    redu_dir = f"{redu_path}{unsats_dir}/{camera}/"
-    # if it doesn't already exisct, make it
+    redu_dir = run_params["redu_dir"]
+    unsats_dir = run_params["unsats_dir"]
+    camera = run_params["camera"]
+
     if not os.path.exists(redu_dir):
         os.mkdir(redu_dir)
 
     _configure_preprocess_logging(redu_dir)
-    _copy_preprocess_config_to_redu(config_source_path, redu_dir)
+    _copy_preprocess_config_to_redu(run_params.get("config_source_path"), redu_dir)
     log.info("=> Processing %s %s (redu_dir=%s)", unsats_dir, camera, redu_dir)
 
-    # STEP 0
-    file_table = find_filetable(
-        redu_dir,
-        obs_path,
-        unsats_dir,
-        camera,
-        max_files,
-        redu_path,
-        force_rerun,
-        masterdark_dir=masterdark_dir,
-    )
-    
-    # STEP 1
-    clean_cube_path = make_clean_cube(file_table, redu_dir, obs_path, unsats_dir, camera, force_rerun)
+    file_table = find_filetable(run_params)
+    clean_cube_path = make_clean_cube(run_params, file_table)
+    centered_file_table = make_centered_cube(run_params, clean_cube_path, file_table)
+    average_image = make_average_image(run_params, centered_file_table)
 
-    # STEP 2
-    centered_file_table = make_centered_cube(
-        clean_cube_path,
-        file_table,
-        redu_dir,
-        pct_cut,
-        force_rerun,
-        save_plot=plot,
-        crop_shape=crop_shape,
-        fit_func=fit_func,
-    )
-
-    # STEP 3
-    average_image = make_average_image(centered_file_table, redu_dir, px_max=px_max, pct_cut=pct_cut, force_rerun=force_rerun, save_plot=plot)
-
-    # END OF PIPELINE
     return average_image
 
 ########################## Pipeline functionality ##############################
+
+########### Logger Setup ##############
+
+def _redu_pkg_logger():
+    """Parent of ``preprocess`` / ``filtering`` so both share one set of handlers."""
+    p = log.parent
+    return p if p.name else log
+
+
+def _ensure_stderr_logging():
+    """Attach a stderr handler on the redu package logger (shared with ``filtering``)."""
+    pkg = _redu_pkg_logger()
+    if pkg.handlers:
+        return
+    sh = logging.StreamHandler(sys.stderr)
+    sh.setFormatter(logging.Formatter("%(levelname)s %(message)s"))
+    pkg.addHandler(sh)
+    pkg.setLevel(logging.INFO)
+    pkg.propagate = False
+    log.propagate = True
+
+
+def _configure_preprocess_logging(redu_dir):
+    """
+    Log to ``{redu_dir}/preprocess.log`` (overwrite each run) and stderr.
+    Same directory as ``PREPROCESS_CONFIG_SNAPSHOT_NAME`` (``preprocess_config.txt``).
+
+    Handlers are attached to the ``tools4magaox.redu`` package logger so sibling modules
+    (e.g. ``filtering``) also write to the same file.
+    """
+    os.makedirs(redu_dir, exist_ok=True)
+    log_path = os.path.join(redu_dir, PREPROCESS_LOG_NAME)
+    fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
+    pkg = _redu_pkg_logger()
+    for h in list(pkg.handlers):
+        pkg.removeHandler(h)
+    for h in list(log.handlers):
+        log.removeHandler(h)
+    fh = logging.FileHandler(log_path, mode="w", encoding="utf-8")
+    fh.setFormatter(fmt)
+    pkg.addHandler(fh)
+    sh = logging.StreamHandler(sys.stderr)
+    sh.setFormatter(fmt)
+    pkg.addHandler(sh)
+    pkg.setLevel(logging.INFO)
+    pkg.propagate = False
+    log.propagate = True
+    log.info("Preprocess log file: %s", log_path)
+
+
+def _copy_preprocess_config_to_redu(config_source_path, redu_dir):
+    """Copy the preprocess config file into ``redu_dir`` for provenance."""
+    if not config_source_path:
+        return
+    src = os.path.abspath(os.fspath(config_source_path))
+    if not os.path.isfile(src):
+        return
+    os.makedirs(redu_dir, exist_ok=True)
+    dst = os.path.join(redu_dir, PREPROCESS_CONFIG_SNAPSHOT_NAME)
+    shutil.copy2(src, dst)
+    log.info("Saved config snapshot: %s", dst)
+
 
 ############ Conf File reads ##############
 # TODO: maybe make this it's own file
@@ -739,10 +777,13 @@ def run_preprocess_from_config(params, config_source_path=None):
     """
     Validate ``params`` and run :func:`preprocess_main` for each unsats directory and camera.
 
-    Optional keys (defaults match :func:`preprocess_main`): ``pct_cut``, ``plot``, ``max_files``.
+    For each run, builds a per-camera dict with :func:`build_preprocess_run_params` and passes
+    it to :func:`preprocess_main`; step functions read the keys they need from that dict.
+
+    Optional keys in ``params`` (defaults in :func:`build_preprocess_run_params`): ``pct_cut``,
+    ``px_max``, ``plot``, ``max_files``, ``force_rerun``, ``fit_func``.
     ``masterdark_dir`` (optional): root to search for master dark FITS; defaults to ``redu_path``.
-    ``crop_shape`` or ``crop_size`` (optional): 2-tuple like ``(64, 64)`` used to crop frames
-    before Gaussian fitting in step 2.
+    ``crop_shape`` or ``crop_size`` (optional): 2-tuple like ``(64, 64)`` for step-2 cropping.
 
     ``config_source_path`` (optional): path to the config file on disk; copied into each
     ``{redu_path}{unsats_dir}/{camera}/`` as ``preprocess_config.txt``.
@@ -750,38 +791,19 @@ def run_preprocess_from_config(params, config_source_path=None):
     missing = check_preproc_config(params)
     if missing:
         raise ValueError(f"config missing or invalid keys: {missing}")
-    #TODO: maybe just pass all the params into preprocess_main instead of having individuals
-    obs_path = params["obs_path"]
-    redu_path = params["redu_path"]
     unsats_dirs = _unsats_dir_list(params)
     cameras = list(params["cameras"])
-    pct_cut = params.get("pct_cut", 10)
-    px_max = params.get("px_max", 5)
-    plot = params.get("plot", False)
-    fit_func = params.get("fit_func", "gauss_min")
-    force_rerun = params.get("force_rerun", False)
-    max_files = params.get("max_files", -1)
-    masterdark_dir = params.get("masterdark_dir")
-    crop_shape = params.get("crop_shape", params.get("crop_size"))
 
     for unsats_dir in unsats_dirs:
         for camera in cameras:
             try:
-                preprocess_main(
-                    obs_path,
+                run = build_preprocess_run_params(
+                    params,
                     unsats_dir,
-                    redu_path,
-                    camera=camera,
-                    pct_cut=pct_cut,
-                    px_max=px_max,
-                    plot=plot,
-                    max_files=max_files,
-                    masterdark_dir=masterdark_dir,
-                    crop_shape=crop_shape,
-                    fit_func=fit_func,
-                    force_rerun=force_rerun,
+                    camera,
                     config_source_path=config_source_path,
                 )
+                preprocess_main(run)
             except Exception:
                 log.exception("Error processing %s %s", unsats_dir, camera)
 
