@@ -27,8 +27,7 @@ log = logging.getLogger(__name__)
 
 # files you should expect this script to make
 FILE_TABLE_NAME = "file_table.txt"
-CENTERED_FILE_TABLE_NAME = "file_table_centered.txt"
-FILE_TABLE_AVERAGE_NAME = "file_table_average.txt"
+FILE_TABLE_OUTPUT_NAME = "file_table_output.txt"
 CLEAN_CUBE_NAME = "clean_cube.fits"
 CENTERED_CUBE_NAME = "centered_cube.fits"
 AVERAGE_IMAGE_NAME = "average_image.fits"
@@ -36,18 +35,25 @@ AVERAGE_IMAGE_NAME = "average_image.fits"
 PREPROCESS_CONFIG_SNAPSHOT_NAME = "preprocess_config.txt"
 PREPROCESS_LOG_NAME = "preprocess.log"
 
+_REDU_ASCII_FMT = "ascii.commented_header"
 
 ############# Main Functions #############
 
 # STEP 0
 def find_filetable(run_params):
     '''
-    Checks to see if the table exists in redu_path
-    If it doesn't, it's created
+    Load or build the static file table and ``file_table_output`` (see :func:`_load_file_table`).
+
+    Returns
+    -------
+    tuple[Table, Table]
+        ``(file_table_static, file_table_output)`` — telemetry and ``masterdark_path``
+        only in the first table; pipeline filters and Gaussian parameters in the second.
 
     Reads from ``run_params``: ``redu_dir``, ``obs_path``, ``unsats_dir``, ``camera``,
     ``max_files``, ``redu_path``, ``force_rerun``, ``masterdark_dir``.
     '''
+    log.info("0. Finding file table")
     redu_dir = run_params["redu_dir"]
     obs_path = run_params["obs_path"]
     unsats_dir = run_params["unsats_dir"]
@@ -57,28 +63,38 @@ def find_filetable(run_params):
     force_rerun = run_params["force_rerun"]
     masterdark_dir = run_params.get("masterdark_dir")
 
-    log.info("0. Finding file table")
-    file_table_path = f"{redu_dir}/{FILE_TABLE_NAME}"
+    static_path = os.path.join(redu_dir, FILE_TABLE_NAME)
+    output_path = os.path.join(redu_dir, FILE_TABLE_OUTPUT_NAME)
 
-    if os.path.exists(file_table_path) and force_rerun == False:
+    if (
+        not force_rerun
+        and os.path.isfile(static_path)
+        and os.path.isfile(output_path)
+    ):
         log.info("=> LOADING FILE TABLE")
-        file_table = Table.read(file_table_path, format="ascii.commented_header")
-    else:
-        log.info("=> CREATING FILE TABLE")
-        # 0.0 - file table
-        unsat_files = find_files(obs_path, unsats_dir, camera, max_files)
-        unsats_table = fr.fits_telemetry_table(unsat_files, camera)
-        # 0.1 - dark files needed merged with file table
-        dark_search_dir = _resolve_masterdark_search_dir(redu_path, masterdark_dir)
-        file_table_darks = find_dark_files(dark_search_dir, unsats_table, camera)
-        # 0.2 - pick the parameters that are in the largest number of files
-        file_table = pick_unsat_params(file_table_darks)
-        # 0.3 - write the file table
-        file_table.write(file_table_path, format="ascii.commented_header", overwrite=True)
-    return file_table
+        file_table_static = _read_redu_table(static_path)
+        if "to_use" in file_table_static.colnames:
+            raise ValueError(
+                f"{FILE_TABLE_NAME} contains deprecated column 'to_use'. "
+                "Delete it and file_table_output.txt (or set force_rerun) to regenerate."
+            )
+        file_table_output = _read_redu_table(output_path)
+        return file_table_static, file_table_output
+
+    log.info("=> CREATING FILE TABLE")
+    unsat_files = find_files(obs_path, unsats_dir, camera, max_files)
+    unsats_table = fr.fits_telemetry_table(unsat_files, camera)
+    dark_search_dir = _resolve_masterdark_search_dir(redu_path, masterdark_dir)
+    file_table_darks = find_dark_files(dark_search_dir, unsats_table, camera)
+    file_table_full = pick_unsat_params(file_table_darks)
+    file_table_static = _file_table_static_from_full(file_table_full)
+    file_table_output = _init_file_table_output(file_table_full)
+    _write_redu_table(file_table_static, static_path)
+    _write_redu_table(file_table_output, output_path)
+    return file_table_static, file_table_output
 
 # STEP 1
-def make_clean_cube(run_params, file_table_total):
+def make_clean_cube(run_params, file_table_static, file_table_output):
     '''
     Makes a clean cube from all unsat files in majority param set
 
@@ -92,13 +108,16 @@ def make_clean_cube(run_params, file_table_total):
     force_rerun = run_params["force_rerun"]
 
     log.info("1. Making clean cube")
-    clean_cube_path = f"{redu_dir}/{CLEAN_CUBE_NAME}"
+    clean_cube_path = os.path.join(redu_dir, CLEAN_CUBE_NAME)
 
     if os.path.exists(clean_cube_path) and force_rerun == False:
         log.info("=> CLEAN CUBE EXISTS, SKIPPING")
     else:
         log.info("=> CREATING CLEAN CUBE")
         # 1.0 find files to use (telemetry table stores basenames only)
+        file_table_total = _ephemeral_file_table_with_to_use(
+            file_table_static, file_table_output
+        )
         used = file_table_total[file_table_total["to_use"] == 1]
         prefix = f"{obs_path}{unsats_dir}/{camera}/"
         unsat_files = [prefix + str(fn) for fn in used["filename"]]
@@ -114,14 +133,14 @@ def make_clean_cube(run_params, file_table_total):
     return clean_cube_path
 
 # STEP 2
-def make_centered_cube(run_params, clean_cube_path, file_table_total):
+def make_centered_cube(run_params, clean_cube_path, file_table_static, file_table_output):
     '''
     Input: total cube of unsats
     Process:
         1. filter the cube based on max peaks
         2. center the remaining frames
-        3. write the centered cube, 
-        4. write which frames were filtered out, shifts for the remaining frames
+        3. write the centered cube
+        4. update ``file_table_output`` with per-frame filters, shifts, and Gaussian fits
 
     Reads from ``run_params``: ``redu_dir``, ``pct_cut``, ``force_rerun``, ``plot``,
     ``crop_shape``, ``fit_func``.
@@ -134,20 +153,24 @@ def make_centered_cube(run_params, clean_cube_path, file_table_total):
     fit_func = run_params["fit_func"]
 
     log.info("2. Making centered cube")
-    centered_cube_path = f"{redu_dir}/{CENTERED_CUBE_NAME}"
-    centered_file_table_path = f"{redu_dir}/{CENTERED_FILE_TABLE_NAME}"
+    centered_cube_path = os.path.join(redu_dir, CENTERED_CUBE_NAME)
 
     if os.path.exists(centered_cube_path) and force_rerun == False:
         log.info("=> CENTERED CUBE EXISTS, SKIPPING")
-        centered_file_table = Table.read(centered_file_table_path, format="ascii.commented_header")
+        centered_file_table = _filter_file_table_output_for_centering(
+            file_table_output
+        )
     else:
         log.info("=> CREATING CENTERED CUBE")
+        file_table_total = _ephemeral_file_table_with_to_use(
+            file_table_static, file_table_output
+        )
         unsats_data_cube = _load_fits_primary_float32(clean_cube_path)
         # 2.0 filter the cube based on max peaks
         max_values, good_idxs = fl.filter_max_value(unsats_data_cube, perc=pct_cut)
         if save_plot:
             # Keep DATE_OBS aligned with the clean cube ordering (to_use == 1).
-            td_list = filter_file_table_to_use(file_table_total, use_col="to_use")["DATE_OBS"]
+            td_list = _date_obs_for_centering(file_table_static, file_table_output)
             fl.plot_max_filter_timeseries(max_values, good_idxs, td_list, perc=pct_cut, plot_path=redu_dir)
             fl.plot_max_filter_hist(max_values, good_idxs, perc=pct_cut, plot_path=redu_dir)
         # 2.1 find the shifts for the remaining frames
@@ -163,13 +186,18 @@ def make_centered_cube(run_params, clean_cube_path, file_table_total):
         gauss_params = None
         if isinstance(info_dict, dict):
             gauss_params = info_dict.get("gauss_params")
-        centered_file_table = write_centered_file_table(
-            file_table_total,
-            redu_dir,
+        _update_file_table_output_step2(
+            file_table_output,
             max_values,
             good_idxs,
             shifts,
-            gauss_params_good=gauss_params,
+            gauss_params,
+        )
+        _write_redu_table(
+            file_table_output, os.path.join(redu_dir, FILE_TABLE_OUTPUT_NAME)
+        )
+        centered_file_table = _filter_file_table_output_for_centering(
+            file_table_output
         )
         # 2.5 write the centered cube
         fits.PrimaryHDU(data=np.asarray(centered_data_cube, dtype=np.float32)).writeto(
@@ -178,15 +206,15 @@ def make_centered_cube(run_params, clean_cube_path, file_table_total):
     return centered_file_table
 
 # STEP 3
-def make_average_image(run_params, centered_file_table):
+def make_average_image(run_params, centered_file_table, file_table_static, file_table_output):
     '''
-    Input: centered cube of unsats 
+    Input: majority-filtered ``file_table_output`` aligned with the centered cube
     Process:
         1. filter based on the shifts
         2. average the remaining frames
-        3. write the average image, which frames were filtered out
-        4. write ``file_table_average.txt`` — centered table plus ``pass_avg_shift``,
-           ``pass_avg_amp``, ``used_in_average`` (see :func:`write_average_file_table`).
+        3. write the average image
+        4. update ``file_table_output`` with ``pass_avg_shift``, ``pass_avg_amp``,
+           and ``used_in_average``.
 
     Reads from ``run_params``: ``redu_dir``, ``force_rerun``, ``plot``, ``px_max``,
     ``pct_cut`` (used for the Gaussian-amplitude percentile filter in this step).
@@ -198,8 +226,8 @@ def make_average_image(run_params, centered_file_table):
     pct_cut = run_params["pct_cut"]
 
     log.info("3. Making average image")
-    centered_cube_path = f"{redu_dir}/{CENTERED_CUBE_NAME}"
-    average_image_path = f"{redu_dir}/{AVERAGE_IMAGE_NAME}"
+    centered_cube_path = os.path.join(redu_dir, CENTERED_CUBE_NAME)
+    average_image_path = os.path.join(redu_dir, AVERAGE_IMAGE_NAME)
 
     if os.path.exists(average_image_path) and force_rerun == False:
         log.info("=> AVERAGE IMAGE EXISTS, SKIPPING")
@@ -207,7 +235,7 @@ def make_average_image(run_params, centered_file_table):
     else:
         log.info("=> CREATING AVERAGE IMAGE")
         centered_data_cube = _load_fits_primary_float32(centered_cube_path)
-        # 3.0 filter based on the shifts (indices are centered-cube rows 0..n-1)
+        # 3.0 Find the good indexes from average image
         shifts = load_shifts(centered_file_table)
         good_idxs1 = fl.filter_unstat_shifts(shifts, px_max=px_max)
         # mask on usable centring shifts
@@ -223,17 +251,17 @@ def make_average_image(run_params, centered_file_table):
             len(good_idxs),
             len(centered_data_cube),
         )
+        # filter the data cube
         centered_data_cube_filtered = centered_data_cube[good_idxs]
-        write_average_file_table(
-            centered_file_table,
-            redu_dir,
-            good_idxs1,
-            good_idxs2,
-            good_idxs,
+        average_stage_subset = _subset_table_with_average_pass_flags(
+            centered_file_table, good_idxs1, good_idxs2, good_idxs
         )
-        # Grab the timeseries from the centered file table
+        _persist_file_table_output_after_step3(
+            file_table_output, redu_dir, average_stage_subset
+        )
+        # Grab the timeseries aligned with the filtered output rows
         if save_plot:
-            td_list = centered_file_table["DATE_OBS"][mask]
+            td_list = _date_obs_for_centering(file_table_static, file_table_output)[mask]
             fl.plot_shift_filter_timeseries(shifts, good_idxs, td_list, px_max=px_max, plot_path=redu_dir)
             fl.plot_shift_filter_scatter(shifts, good_idxs, px_max=px_max, plot_path=redu_dir)
             # plot the amplitudes 
@@ -252,6 +280,47 @@ def make_average_image(run_params, centered_file_table):
             average_image_path, overwrite=True
         )
     return average_image
+
+
+###################### File table helper functions ######################
+
+def _read_redu_table(path):
+    """Load a pipeline ASCII metadata table (commented header)."""
+    return Table.read(path, format=_REDU_ASCII_FMT)
+
+def _write_redu_table(table, path):
+    """Write a pipeline ASCII metadata table; creates parent directory if needed."""
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    table.write(path, format=_REDU_ASCII_FMT, overwrite=True)
+
+def _file_table_static_from_full(full_table):
+    """Telemetry + masterdark only (no pipeline filter columns)."""
+    cols = [c for c in full_table.colnames if c != "to_use"]
+    return full_table[cols].copy()
+
+
+def _ephemeral_file_table_with_to_use(file_table_static, file_table_output):
+    """Same roster as static + synthetic ``to_use`` for centered/average writers."""
+    t = file_table_static.copy()
+    t["to_use"] = np.asarray(file_table_output["pass_majority_config"], dtype=int)
+    return t
+
+
+def _filter_file_table_output_for_centering(file_table_output):
+    """
+    One row per clean-cube frame (``pass_majority_config == 1``), in the same order as
+    ``clean_cube.fits`` / ``centered_cube.fits``.
+    """
+    maj = np.asarray(file_table_output["pass_majority_config"], dtype=int) == 1
+    return file_table_output[maj].copy()
+
+
+def _date_obs_for_centering(file_table_static, file_table_output):
+    """DATE_OBS values aligned with the majority-config clean-cube ordering."""
+    maj = np.asarray(file_table_output["pass_majority_config"], dtype=int) == 1
+    return file_table_static["DATE_OBS"][maj]
 
 ###################### STEP 0 helper functions ######################
 
@@ -342,16 +411,76 @@ def _resolve_masterdark_search_dir(redu_path, masterdark_dir):
             return s
     return os.path.expanduser(os.fspath(redu_path)).strip()
 
-
 def _load_fits_primary_float32(path):
     """Load primary HDU data as float32 (reduces RAM vs float64 cubes)."""
     with fits.open(path, memmap=False) as hdul:
         return np.asarray(hdul[0].data, dtype=np.float32)
 
+def _init_file_table_output(full_table):
+    """One row per file: majority filter + placeholders for later steps."""
+    n = len(full_table)
+    to_use = np.asarray(full_table["to_use"], dtype=int)
+    out = Table()
+    out["filename"] = full_table["filename"].copy()
+    out["pass_majority_config"] = to_use.copy()
+    out["max_value"] = np.full(n, np.nan, dtype=float)
+    out["pass_peak_max"] = np.zeros(n, dtype=int)
+    out["shift_x"] = np.full(n, np.nan, dtype=float)
+    out["shift_y"] = np.full(n, np.nan, dtype=float)
+    out["gauss_y"] = np.full(n, np.nan, dtype=float)
+    out["gauss_x"] = np.full(n, np.nan, dtype=float)
+    out["gauss_sigma_y"] = np.full(n, np.nan, dtype=float)
+    out["gauss_sigma_x"] = np.full(n, np.nan, dtype=float)
+    out["gauss_amp"] = np.full(n, np.nan, dtype=float)
+    out["gauss_offset"] = np.full(n, np.nan, dtype=float)
+    out["pass_avg_shift"] = np.zeros(n, dtype=int)
+    out["pass_avg_amp"] = np.zeros(n, dtype=int)
+    out["used_in_average"] = np.zeros(n, dtype=int)
+    return out
+
 ###################### STEP 1 helper functions ######################  
 
 
 ###################### STEP 2 helper functions ######################
+
+def _update_file_table_output_step2(
+    file_table_output,
+    max_values,
+    good_idxs,
+    shifts,
+    gauss_params,
+):
+    """Fill centering / Gaussian columns for rows that passed majority (step 1)."""
+    pass_maj = np.asarray(file_table_output["pass_majority_config"], dtype=int)
+    used_rows = np.flatnonzero(pass_maj == 1)
+    n_used = len(used_rows)
+    mv = np.asarray(max_values).ravel()
+    if mv.size != n_used:
+        raise ValueError(
+            f"max_values length {mv.size} != number of pass_majority rows {n_used}"
+        )
+    g = np.asarray(good_idxs, dtype=int).ravel()
+    gset = set(g.tolist())
+    for k in range(n_used):
+        gr = int(used_rows[k])
+        file_table_output["max_value"][gr] = float(mv[k])
+        file_table_output["pass_peak_max"][gr] = 1 if k in gset else 0
+    s = np.asarray(shifts, dtype=float)
+    gp = None
+    if gauss_params is not None:
+        gp = np.asarray(gauss_params, dtype=float)
+    for k, clean_idx in enumerate(g):
+        gr = int(used_rows[int(clean_idx)])
+        file_table_output["shift_x"][gr] = float(s[k, 0])
+        file_table_output["shift_y"][gr] = float(s[k, 1])
+        if gp is not None and gp.ndim == 2 and gp.shape[1] >= 6:
+            file_table_output["gauss_y"][gr] = float(gp[k, 0])
+            file_table_output["gauss_x"][gr] = float(gp[k, 1])
+            file_table_output["gauss_sigma_y"][gr] = float(gp[k, 2])
+            file_table_output["gauss_sigma_x"][gr] = float(gp[k, 3])
+            file_table_output["gauss_amp"][gr] = float(gp[k, 4])
+            file_table_output["gauss_offset"][gr] = float(gp[k, 5])
+    return file_table_output
 
 def filter_file_table_to_use(file_table_total, use_col="to_use"):
     """
@@ -362,105 +491,74 @@ def filter_file_table_to_use(file_table_total, use_col="to_use"):
     mask = file_table_total[use_col] == 1
     return file_table_total[mask].copy()
 
-def write_centered_file_table(
-    file_table_total,
-    redu_dir,
-    max_values,
-    good_idxs,
-    shifts_yx_good,
-    gauss_params_good=None,
-    use_col="to_use"):
+
+def _subset_table_with_average_pass_flags(
+    centered_subset, good_idxs1, good_idxs2, good_idxs
+):
     """
-    Build the centered metadata table: copy the full file table, keep only rows
-    with ``use_col == 1`` (same order as the clean cube), then add
-
-    - ``max_value`` — per-frame max used by :func:`filtering.max_filter`
-    - ``in_good_idxs`` — 1 if that cube index is in ``good_idxs``, else 0
-    - ``shift_x``, ``shift_y`` — centroid shifts for frames in ``good_idxs``
-      (from :func:`centering.gaussian_fit_shifts`: row ``k`` is ``(dx, dy)`` as
-      x then y); NaN for frames that failed the max filter
-    - Gaussian fit parameters for frames in ``good_idxs`` (NaN otherwise):
-      ``gauss_x``, ``gauss_y``, ``gauss_sigma_x``, ``gauss_sigma_y``,
-      ``gauss_amp``, ``gauss_offset``.
-
-    ``shifts_yx_good`` must have shape ``(len(good_idxs), 2)``; row ``k`` pairs
-    with cube index ``good_idxs[k]`` (components are x, y).
-
-    Writes ``{redu_dir}/{CENTERED_FILE_TABLE_NAME}`` (commented_header ASCII).
-    Returns the table.
+    Copy the centered-roster table and add ``pass_avg_shift``, ``pass_avg_amp``,
+    ``used_in_average`` (indices along ``centered_cube.fits``).
     """
-    ft = filter_file_table_to_use(file_table_total, use_col=use_col)
-    n = len(ft)
-    mv = np.asarray(max_values, dtype=float).ravel()
-    if mv.shape[0] != n:
-        raise ValueError(
-            f"max_values length {mv.shape[0]} != number of used rows {n}"
-        )
-    g = np.asarray(good_idxs, dtype=int).ravel()
-    if np.any(g < 0) or np.any(g >= n):
-        raise ValueError(f"good_idxs must be in [0, {n - 1}], got {g}")
-    s = np.asarray(shifts_yx_good, dtype=float)
-    if s.ndim != 2 or s.shape[1] != 2:
-        raise ValueError("shifts_yx_good must have shape (N, 2) with y, x per row")
-    if s.shape[0] != len(g):
-        raise ValueError(
-            f"shifts_yx_good has {s.shape[0]} rows but good_idxs has {len(g)}"
-        )
+    sy = np.asarray(centered_subset["shift_y"], dtype=float)
+    sx = np.asarray(centered_subset["shift_x"], dtype=float)
+    finite = np.isfinite(sy) & np.isfinite(sx)
+    n_cube = int(np.sum(finite))
+    cube_idx = np.full(len(centered_subset), -1, dtype=np.int64)
+    cube_idx[finite] = np.arange(n_cube, dtype=np.int64)
 
-    gp = None
-    if gauss_params_good is not None:
-        gp = np.asarray(gauss_params_good, dtype=float)
-        if gp.ndim != 2 or gp.shape[1] != 6:
-            raise ValueError(
-                "gauss_params_good must have shape (N, 6): (y0, x0, sigma_y, sigma_x, amp, offset)"
-            )
-        if gp.shape[0] != len(g):
-            raise ValueError(
-                f"gauss_params_good has {gp.shape[0]} rows but good_idxs has {len(g)}"
-            )
+    g1 = set(np.asarray(good_idxs1, dtype=int).ravel().tolist())
+    g2 = set(np.asarray(good_idxs2, dtype=int).ravel().tolist())
+    gu = set(np.asarray(good_idxs, dtype=int).ravel().tolist())
 
-    in_good = np.zeros(n, dtype=int)
-    in_good[g] = 1
-    shift_y = np.full(n, np.nan, dtype=float)
-    shift_x = np.full(n, np.nan, dtype=float)
-    gauss_y = np.full(n, np.nan, dtype=float)
-    gauss_x = np.full(n, np.nan, dtype=float)
-    gauss_sigma_y = np.full(n, np.nan, dtype=float)
-    gauss_sigma_x = np.full(n, np.nan, dtype=float)
-    gauss_amp = np.full(n, np.nan, dtype=float)
-    gauss_offset = np.full(n, np.nan, dtype=float)
-    # ``gaussian_fit_shifts`` returns (dx, dy) as (x, y) — see centering._gaussian_xy_shifts
-    for k, idx in enumerate(g):
-        shift_x[idx] = s[k, 0]
-        shift_y[idx] = s[k, 1]
-        if gp is not None:
-            # params: (y0, x0, sigma_y, sigma_x, amplitude, offset)
-            gauss_y[idx] = gp[k, 0]
-            gauss_x[idx] = gp[k, 1]
-            gauss_sigma_y[idx] = gp[k, 2]
-            gauss_sigma_x[idx] = gp[k, 3]
-            gauss_amp[idx] = gp[k, 4]
-            gauss_offset[idx] = gp[k, 5]
+    pass_shift = np.zeros(len(centered_subset), dtype=int)
+    pass_amp = np.zeros(len(centered_subset), dtype=int)
+    used_avg = np.zeros(len(centered_subset), dtype=int)
+    for i in range(len(centered_subset)):
+        ci = int(cube_idx[i])
+        if ci < 0:
+            continue
+        if ci in g1:
+            pass_shift[i] = 1
+        if ci in g2:
+            pass_amp[i] = 1
+        if ci in gu:
+            used_avg[i] = 1
 
-    out = ft.copy()
-    out["max_value"] = mv
-    out["in_good_idxs"] = in_good
-    out["shift_y"] = shift_y
-    out["shift_x"] = shift_x
-    out["gauss_y"] = gauss_y
-    out["gauss_x"] = gauss_x
-    out["gauss_sigma_y"] = gauss_sigma_y
-    out["gauss_sigma_x"] = gauss_sigma_x
-    out["gauss_amp"] = gauss_amp
-    out["gauss_offset"] = gauss_offset
-
-    os.makedirs(redu_dir, exist_ok=True)
-    out_path = os.path.join(redu_dir, CENTERED_FILE_TABLE_NAME)
-    out.write(out_path, format="ascii.commented_header", overwrite=True)
+    out = centered_subset.copy()
+    out["pass_avg_shift"] = pass_shift
+    out["pass_avg_amp"] = pass_amp
+    out["used_in_average"] = used_avg
     return out
 
 
 ###################### STEP 3 helper functions ######################
+
+def _merge_file_table_output_step3(file_table_output, subset_with_avg_flags):
+    """Copy step-3 filter flags from the centered-roster subset table back to full roster."""
+    fn_to_i = {
+        str(file_table_output["filename"][i]): i for i in range(len(file_table_output))
+    }
+    ct = subset_with_avg_flags
+    for i in range(len(ct)):
+        fn = str(ct["filename"][i])
+        if fn not in fn_to_i:
+            continue
+        j = fn_to_i[fn]
+        file_table_output["pass_avg_shift"][j] = int(ct["pass_avg_shift"][i])
+        file_table_output["pass_avg_amp"][j] = int(ct["pass_avg_amp"][i])
+        file_table_output["used_in_average"][j] = int(ct["used_in_average"][i])
+    return file_table_output
+
+def _persist_file_table_output_after_step3(file_table_output, redu_dir, subset_with_flags):
+    """
+    Merge step-3 flags from ``subset_with_flags`` (centered roster + ``pass_avg_*`` /
+    ``used_in_average``) into the full ``file_table_output`` and save.
+    """
+    _merge_file_table_output_step3(file_table_output, subset_with_flags)
+    _write_redu_table(
+        file_table_output, os.path.join(redu_dir, FILE_TABLE_OUTPUT_NAME)
+    )
+    return file_table_output
 
 def load_shifts(centered_file_table):
     """
@@ -480,62 +578,6 @@ def load_table_params(param_col, file_table):
     """
     param_array = np.asarray(file_table[param_col], dtype=float)
     return param_array
-
-
-def write_average_file_table(
-    centered_file_table,
-    redu_dir,
-    good_idxs1,
-    good_idxs2,
-    good_idxs,
-):
-    """
-    Copy the centered metadata table and add per-row flags for step-3 filters (indices are
-    **centered-cube** frame indices ``0 .. n_cube-1``, same as ``centered_cube.fits``).
-
-    New columns (0/1; rows without finite shifts are 0):
-
-    - ``pass_avg_shift`` — frame index in ``good_idxs1`` (unstable-shift filter)
-    - ``pass_avg_amp`` — frame index in ``good_idxs2`` (amplitude / max-value percentile filter)
-    - ``used_in_average`` — frame index in ``good_idxs`` (intersection; frames averaged)
-
-    Writes ``{redu_dir}/{FILE_TABLE_AVERAGE_NAME}``.
-    """
-    sy = np.asarray(centered_file_table["shift_y"], dtype=float)
-    sx = np.asarray(centered_file_table["shift_x"], dtype=float)
-    finite = np.isfinite(sy) & np.isfinite(sx)
-    n_cube = int(np.sum(finite))
-    cube_idx = np.full(len(centered_file_table), -1, dtype=np.int64)
-    cube_idx[finite] = np.arange(n_cube, dtype=np.int64)
-
-    g1 = set(np.asarray(good_idxs1, dtype=int).ravel().tolist())
-    g2 = set(np.asarray(good_idxs2, dtype=int).ravel().tolist())
-    gu = set(np.asarray(good_idxs, dtype=int).ravel().tolist())
-
-    pass_shift = np.zeros(len(centered_file_table), dtype=int)
-    pass_amp = np.zeros(len(centered_file_table), dtype=int)
-    used_avg = np.zeros(len(centered_file_table), dtype=int)
-    for i in range(len(centered_file_table)):
-        ci = int(cube_idx[i])
-        if ci < 0:
-            continue
-        if ci in g1:
-            pass_shift[i] = 1
-        if ci in g2:
-            pass_amp[i] = 1
-        if ci in gu:
-            used_avg[i] = 1
-
-    out = centered_file_table.copy()
-    out["pass_avg_shift"] = pass_shift
-    out["pass_avg_amp"] = pass_amp
-    out["used_in_average"] = used_avg
-
-    os.makedirs(redu_dir, exist_ok=True)
-    out_path = os.path.join(redu_dir, FILE_TABLE_AVERAGE_NAME)
-    out.write(out_path, format="ascii.commented_header", overwrite=True)
-    log.info("Wrote average-stage table: %s", out_path)
-    return out
 
 
 ###################### MAIN FUNCTIONS ######################
@@ -588,6 +630,10 @@ def preprocess_main(run_params):
         reads (see ``find_filetable``, ``make_clean_cube``, ``make_centered_cube``,
         ``make_average_image``).
 
+        Step 0 writes ``file_table.txt`` (static telemetry + ``masterdark_path``) and
+        ``file_table_output.txt`` (all pipeline filters, fits, and average-stage flags);
+        later steps refresh that output table. There are no separate centered/average table files.
+
     ``masterdark_dir`` in ``run_params`` sets where to search for ``*masterdark*.fits``.
     ``config_source_path`` in ``run_params``: if set, copy to ``redu_dir`` as
     ``preprocess_config.txt``.
@@ -603,10 +649,14 @@ def preprocess_main(run_params):
     _copy_preprocess_config_to_redu(run_params.get("config_source_path"), redu_dir)
     log.info("=> Processing %s %s (redu_dir=%s)", unsats_dir, camera, redu_dir)
 
-    file_table = find_filetable(run_params)
-    clean_cube_path = make_clean_cube(run_params, file_table)
-    centered_file_table = make_centered_cube(run_params, clean_cube_path, file_table)
-    average_image = make_average_image(run_params, centered_file_table)
+    file_table_static, file_table_output = find_filetable(run_params)
+    clean_cube_path = make_clean_cube(run_params, file_table_static, file_table_output)
+    centered_file_table = make_centered_cube(
+        run_params, clean_cube_path, file_table_static, file_table_output
+    )
+    average_image = make_average_image(
+        run_params, centered_file_table, file_table_static, file_table_output
+    )
 
     return average_image
 
@@ -713,6 +763,7 @@ def read_preproc_config(config_path):
                 ) from e
     return params
 
+
 def _nonempty_str(x):
     return isinstance(x, str) and bool(x.strip())
 
@@ -734,6 +785,7 @@ def _unsats_dirs_ok(params):
     if "unsats_dir" in params and _nonempty_str(params["unsats_dir"]):
         return True
     return False
+
 
 def check_preproc_config(params):
     """
@@ -829,6 +881,8 @@ def cli_preprocess(argv=None):
         except ValueError as e:
             log.exception("%s: %s", cfg_path, e)
             raise SystemExit(1) from e
+
+#####################################################################
 
 if __name__ == "__main__":
     # collects args from command line and runs the preprocess pipeline
