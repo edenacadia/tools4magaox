@@ -1,14 +1,103 @@
 # filereads.py
 # 2026/04/07
 # the purpose of this file is to coordinate how files and telemetry is read into the reduction pipeline
+import glob
+import logging
 import os
 from tqdm import trange, tqdm
 from astropy.table import Table
+import darks as md
 from darks import _detect_camera_tag_from_header
 
 from astropy.io import fits
 import numpy as np
 from datetime import datetime, timezone
+
+log = logging.getLogger(__name__)
+
+_REDU_ASCII_FMT = "ascii.commented_header"
+
+
+def _load_fits_primary_float32(path):
+    """Load primary HDU data as float32 (reduces RAM vs float64 cubes)."""
+    with fits.open(path, memmap=False) as hdul:
+        return np.asarray(hdul[0].data, dtype=np.float32)
+
+def _load_fits_primary_float64(path):
+    """Load primary HDU data as float64 (reduces RAM vs float64 cubes)."""
+    with fits.open(path, memmap=False) as hdul:
+        return np.asarray(hdul[0].data, dtype=np.float64)
+
+def _save_fits_primary_float32(data, path):
+    """Save primary HDU data as float32 (reduces RAM vs float64 cubes)."""
+    fits.PrimaryHDU(data=np.asarray(data, dtype=np.float32)).writeto(path, overwrite=True)
+
+def _save_fits_primary_float64(data, path):
+    """Save primary HDU data as float64 (reduces RAM vs float64 cubes)."""
+    fits.PrimaryHDU(data=np.asarray(data, dtype=np.float64)).writeto(path, overwrite=True)
+
+def read_redu_table(path):
+    """Load a pipeline ASCII metadata table (commented header)."""
+    return Table.read(path, format=_REDU_ASCII_FMT)
+
+
+def write_redu_table(table, path):
+    """Write a pipeline ASCII metadata table; creates parent directory if needed."""
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    table.write(path, format=_REDU_ASCII_FMT, overwrite=True)
+
+
+def find_camera_files(obs_path, obs_dir, camera="camsci1", max_files=-1):
+    """
+    Find FITS files in ``{obs_path}{obs_dir}/{camera}/`` and return sorted paths.
+    """
+    file_paths = glob.glob(f"{obs_path}{obs_dir}/{camera}/*")
+    if max_files < 0:
+        return sorted(file_paths)
+    if max_files > len(file_paths):
+        max_files = len(file_paths)
+    return sorted(file_paths)[:max_files]
+
+
+def resolve_masterdark_search_dir(redu_path, masterdark_dir):
+    """Directory tree to search for ``*masterdark*.fits*`` (recursive)."""
+    if masterdark_dir is not None:
+        s = os.path.expanduser(os.fspath(masterdark_dir)).strip()
+        if s:
+            return s
+    return os.path.expanduser(os.fspath(redu_path)).strip()
+
+
+def attach_masterdarks(file_table, dark_search_dir, camera):
+    """
+    Add ``masterdark_path`` to each row using darks matched from telemetry.
+    """
+    unique_configs = md.unique_telemetry_configs_for_dark_lookup(file_table, camera=camera)
+    dark_dictionary = md.lookup_masterdarks_from_telemetry_table(
+        unique_configs,
+        redu_dir=dark_search_dir,
+        camera=camera,
+    )
+    for config in dark_dictionary:
+        if len(config["masterdark_paths"]) == 0:
+            log.warning("No master dark found for configuration: %s", config)
+    return md.merge_file_table_with_darks(file_table, dark_dictionary)
+
+
+def init_process_output_table():
+    """
+    Zero-row manifest of process-pipeline outputs to populate as steps run.
+    """
+    out = Table()
+    out["step"] = np.array([], dtype=int)
+    out["product"] = np.array([], dtype="U64")
+    out["source_filename"] = np.array([], dtype="U256")
+    out["path"] = np.array([], dtype="U1024")
+    out["status"] = np.array([], dtype="U32")
+    out["notes"] = np.array([], dtype="U256")
+    return out
 
 
 def pull_hdr_params(hdr, camera, darks=True):

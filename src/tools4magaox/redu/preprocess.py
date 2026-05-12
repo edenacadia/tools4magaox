@@ -39,8 +39,46 @@ _REDU_ASCII_FMT = "ascii.commented_header"
 
 ############# Main Functions #############
 
+def preprocess_main(run_params):
+    """
+    Run preprocess steps 0–3.
+
+    Parameters
+    ----------
+    run_params : dict
+        Built with :func:`build_preprocess_run_params`. Must include ``redu_dir``,
+        ``obs_path``, ``redu_path``, ``unsats_dir``, ``camera``, and the keys each step
+        reads (see ``find_filetable``, ``make_clean_cube``, ``make_centered_cube``,
+        ``make_average_image``).
+
+        Step 0 writes ``file_table.txt`` (static telemetry + ``masterdark_path``) and
+        ``file_table_output.txt`` (all pipeline filters, fits, and average-stage flags);
+        later steps refresh that output table. There are no separate centered/average table files.
+
+    ``masterdark_dir`` in ``run_params`` sets where to search for ``*masterdark*.fits``.
+    ``config_source_path`` in ``run_params``: if set, copy to ``redu_dir`` as
+    ``preprocess_config.txt``.
+    """
+    redu_dir = run_params["redu_dir"]
+    unsats_dir = run_params["unsats_dir"]
+    camera = run_params["camera"]
+
+    if not os.path.exists(redu_dir):
+        os.mkdir(redu_dir)
+
+    _configure_preprocess_logging(redu_dir)
+    _copy_preprocess_config_to_redu(run_params.get("config_source_path"), redu_dir)
+    log.info("=> Processing %s %s (redu_dir=%s)", unsats_dir, camera, redu_dir)
+
+    file_table_static, file_table_output = s0_create_filetable(run_params)
+    clean_cube_path = s1_make_clean_cube(run_params, file_table_static, file_table_output)
+    centered_file_table = s2_make_centered_cube(run_params, clean_cube_path, file_table_static, file_table_output)
+    average_image = s3_make_average_image(run_params, centered_file_table, file_table_static, file_table_output)
+
+    return average_image
+
 # STEP 0
-def find_filetable(run_params):
+def s0_create_filetable(run_params):
     '''
     Load or build the static file table and ``file_table_output`` (see :func:`_load_file_table`).
 
@@ -94,7 +132,7 @@ def find_filetable(run_params):
     return file_table_static, file_table_output
 
 # STEP 1
-def make_clean_cube(run_params, file_table_static, file_table_output):
+def s1_make_clean_cube(run_params, file_table_static, file_table_output):
     '''
     Makes a clean cube from all unsat files in majority param set
 
@@ -133,7 +171,7 @@ def make_clean_cube(run_params, file_table_static, file_table_output):
     return clean_cube_path
 
 # STEP 2
-def make_centered_cube(run_params, clean_cube_path, file_table_static, file_table_output):
+def s2_make_centered_cube(run_params, clean_cube_path, file_table_static, file_table_output):
     '''
     Input: total cube of unsats
     Process:
@@ -202,7 +240,7 @@ def make_centered_cube(run_params, clean_cube_path, file_table_static, file_tabl
     return centered_file_table
 
 # STEP 3
-def make_average_image(run_params, centered_file_table, file_table_static, file_table_output):
+def s3_make_average_image(run_params, centered_file_table, file_table_static, file_table_output):
     '''
     Input: majority-filtered ``file_table_output`` aligned with the centered cube
     Process:
@@ -296,13 +334,11 @@ def _file_table_static_from_full(full_table):
     cols = [c for c in full_table.colnames if c != "to_use"]
     return full_table[cols].copy()
 
-
 def _ephemeral_file_table_with_to_use(file_table_static, file_table_output):
     """Same roster as static + synthetic ``to_use`` for centered/average writers."""
     t = file_table_static.copy()
     t["to_use"] = np.asarray(file_table_output["pass_majority_config"], dtype=int)
     return t
-
 
 def _filter_file_table_output_for_centering(file_table_output):
     """
@@ -311,7 +347,6 @@ def _filter_file_table_output_for_centering(file_table_output):
     """
     maj = np.asarray(file_table_output["pass_majority_config"], dtype=int) == 1
     return file_table_output[maj].copy()
-
 
 def _date_obs_for_centering(file_table_static, file_table_output):
     """DATE_OBS values aligned with the majority-config clean-cube ordering."""
@@ -576,88 +611,6 @@ def load_table_params(param_col, file_table):
     return param_array
 
 
-###################### MAIN FUNCTIONS ######################
-
-def build_preprocess_run_params(
-    params,
-    unsats_dir,
-    camera,
-    *,
-    config_source_path=None,
-):
-    """
-    Shallow copy of config ``params`` plus per-run keys. Each pipeline step reads only
-    the keys it needs from the returned dict.
-
-    Required in ``params``: ``obs_path``, ``redu_path`` (and typically ``cameras`` at
-    config level; ``camera`` here overrides the per-run value).
-
-    Sets defaults: ``pct_cut``, ``gauss_amp_pct_cut``, ``px_max``, ``plot``,
-    ``max_files``, ``force_rerun``, ``fit_func``, ``crop_shape`` (from ``crop_size``
-    if needed), ``masterdark_dir``.
-    Adds ``unsats_dir``, ``camera``, ``redu_dir``, and optionally ``config_source_path``.
-    """
-    p = dict(params)
-    p["unsats_dir"] = unsats_dir.strip() if isinstance(unsats_dir, str) else unsats_dir
-    p["camera"] = camera
-    p["redu_dir"] = f"{p['redu_path']}{p['unsats_dir']}/{p['camera']}/"
-    p.setdefault("pct_cut", 10)
-    p.setdefault("gauss_amp_pct_cut", p["pct_cut"])
-    p.setdefault("px_max", 5)
-    p.setdefault("plot", False)
-    p.setdefault("max_files", -1)
-    p.setdefault("force_rerun", False)
-    p.setdefault("fit_func", "gauss_min")
-    if "crop_shape" not in p and p.get("crop_size") is not None:
-        p["crop_shape"] = p["crop_size"]
-    p.setdefault("crop_shape", None)
-    if config_source_path is not None:
-        p["config_source_path"] = config_source_path
-    return p
-
-
-def preprocess_main(run_params):
-    """
-    Run preprocess steps 0–3.
-
-    Parameters
-    ----------
-    run_params : dict
-        Built with :func:`build_preprocess_run_params`. Must include ``redu_dir``,
-        ``obs_path``, ``redu_path``, ``unsats_dir``, ``camera``, and the keys each step
-        reads (see ``find_filetable``, ``make_clean_cube``, ``make_centered_cube``,
-        ``make_average_image``).
-
-        Step 0 writes ``file_table.txt`` (static telemetry + ``masterdark_path``) and
-        ``file_table_output.txt`` (all pipeline filters, fits, and average-stage flags);
-        later steps refresh that output table. There are no separate centered/average table files.
-
-    ``masterdark_dir`` in ``run_params`` sets where to search for ``*masterdark*.fits``.
-    ``config_source_path`` in ``run_params``: if set, copy to ``redu_dir`` as
-    ``preprocess_config.txt``.
-    """
-    redu_dir = run_params["redu_dir"]
-    unsats_dir = run_params["unsats_dir"]
-    camera = run_params["camera"]
-
-    if not os.path.exists(redu_dir):
-        os.mkdir(redu_dir)
-
-    _configure_preprocess_logging(redu_dir)
-    _copy_preprocess_config_to_redu(run_params.get("config_source_path"), redu_dir)
-    log.info("=> Processing %s %s (redu_dir=%s)", unsats_dir, camera, redu_dir)
-
-    file_table_static, file_table_output = find_filetable(run_params)
-    clean_cube_path = make_clean_cube(run_params, file_table_static, file_table_output)
-    centered_file_table = make_centered_cube(
-        run_params, clean_cube_path, file_table_static, file_table_output
-    )
-    average_image = make_average_image(
-        run_params, centered_file_table, file_table_static, file_table_output
-    )
-
-    return average_image
-
 ########################## Pipeline functionality ##############################
 
 ########### Logger Setup ##############
@@ -761,30 +714,6 @@ def read_preproc_config(config_path):
                 ) from e
     return params
 
-
-def _nonempty_str(x):
-    return isinstance(x, str) and bool(x.strip())
-
-
-def _nonempty_camera_list(x):
-    if not isinstance(x, (list, tuple)) or len(x) == 0:
-        return False
-    return all(_nonempty_str(c) for c in x)
-
-
-def _unsats_dirs_ok(params):
-    """True if ``unsats_dirs`` or legacy ``unsats_dir`` is present and usable."""
-    if "unsats_dirs" in params:
-        u = params["unsats_dirs"]
-        if _nonempty_str(u):
-            return True
-        if isinstance(u, (list, tuple)) and len(u) > 0 and all(_nonempty_str(d) for d in u):
-            return True
-    if "unsats_dir" in params and _nonempty_str(params["unsats_dir"]):
-        return True
-    return False
-
-
 def check_preproc_config(params):
     """
     Verify required preprocess parameters: ``obs_path``, ``redu_path``,
@@ -811,6 +740,28 @@ def check_preproc_config(params):
         bad.append("cameras")
     return bad
 
+def _nonempty_str(x):
+    return isinstance(x, str) and bool(x.strip())
+
+
+def _nonempty_camera_list(x):
+    if not isinstance(x, (list, tuple)) or len(x) == 0:
+        return False
+    return all(_nonempty_str(c) for c in x)
+
+
+def _unsats_dirs_ok(params):
+    """True if ``unsats_dirs`` or legacy ``unsats_dir`` is present and usable."""
+    if "unsats_dirs" in params:
+        u = params["unsats_dirs"]
+        if _nonempty_str(u):
+            return True
+        if isinstance(u, (list, tuple)) and len(u) > 0 and all(_nonempty_str(d) for d in u):
+            return True
+    if "unsats_dir" in params and _nonempty_str(params["unsats_dir"]):
+        return True
+    return False
+
 def _unsats_dir_list(params):
     """Return a list of unsats directory names from config (``unsats_dirs`` or ``unsats_dir``)."""
     if "unsats_dirs" in params:
@@ -822,6 +773,8 @@ def _unsats_dir_list(params):
     if "unsats_dir" in params and _nonempty_str(params["unsats_dir"]):
         return [params["unsats_dir"].strip()]
     return []
+
+############################ Building run iterations ##############################
 
 def run_preprocess_from_config(params, config_source_path=None):
     """
@@ -858,6 +811,42 @@ def run_preprocess_from_config(params, config_source_path=None):
             except Exception:
                 log.exception("Error processing %s %s", unsats_dir, camera)
 
+def build_preprocess_run_params(
+    params,
+    unsats_dir,
+    camera,
+    *,
+    config_source_path=None,
+):
+    """
+    Shallow copy of config ``params`` plus per-run keys. Each pipeline step reads only
+    the keys it needs from the returned dict.
+
+    Required in ``params``: ``obs_path``, ``redu_path`` (and typically ``cameras`` at
+    config level; ``camera`` here overrides the per-run value).
+
+    Sets defaults: ``pct_cut``, ``gauss_amp_pct_cut``, ``px_max``, ``plot``,
+    ``max_files``, ``force_rerun``, ``fit_func``, ``crop_shape`` (from ``crop_size``
+    if needed), ``masterdark_dir``.
+    Adds ``unsats_dir``, ``camera``, ``redu_dir``, and optionally ``config_source_path``.
+    """
+    p = dict(params)
+    p["unsats_dir"] = unsats_dir.strip() if isinstance(unsats_dir, str) else unsats_dir
+    p["camera"] = camera
+    p["redu_dir"] = f"{p['redu_path']}{p['unsats_dir']}/{p['camera']}/"
+    p.setdefault("pct_cut", 10)
+    p.setdefault("gauss_amp_pct_cut", p["pct_cut"])
+    p.setdefault("px_max", 5)
+    p.setdefault("plot", False)
+    p.setdefault("max_files", -1)
+    p.setdefault("force_rerun", False)
+    p.setdefault("fit_func", "gauss_min")
+    if "crop_shape" not in p and p.get("crop_size") is not None:
+        p["crop_shape"] = p["crop_size"]
+    p.setdefault("crop_shape", None)
+    if config_source_path is not None:
+        p["config_source_path"] = config_source_path
+    return p
 
 def cli_preprocess(argv=None):
     """CLI entry: one or more preprocess config paths."""
@@ -886,3 +875,4 @@ def cli_preprocess(argv=None):
 if __name__ == "__main__":
     # collects args from command line and runs the preprocess pipeline
     cli_preprocess()
+    # cli_process() -> run_preprocess_from_config() => preprocess_main()
