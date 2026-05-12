@@ -12,6 +12,7 @@ from hcipy import *
 
 from tools4magaox.constants import *
 import filereads as fr
+import center_spark as cs
 
 log = logging.getLogger(__name__)
 
@@ -114,10 +115,15 @@ def s1_create_reference(run_params):
     Take the unsat, and subtract the unsat nospark if available, then mask the sparkles.
     Save full reference image, masked reference image, and mask image.
     '''
+    # load needed parameters
     redu_dir = run_params["redu_dir"]
     force_rerun = run_params["force_rerun"]
     unsats_dir = run_params["unsats_dir"]
     unsats_nospark_dir = run_params["unsats_nospark_dir"]
+    spark_ang = run_params["spark_ang"]
+    spark_sep = run_params["spark_sep"]
+    wavelength = run_params["wavelength"]
+    # create paths
     reference_image_path = os.path.join(redu_dir, REFERENCE_IMAGE_NAME)
     masked_reference_image_path = os.path.join(redu_dir, MASKED_REFERENCE_IMAGE_NAME)
     mask_image_path = os.path.join(redu_dir, MASK_IMAGE_NAME)
@@ -129,7 +135,7 @@ def s1_create_reference(run_params):
     else:
         log.info("=> CREATING REF IMAGE")
         reference_image = create_reference_image(unsats_dir, unsats_nospark_dir)
-        mask_image = make_sparkle_mask(reference_image)
+        mask_image = cs.make_sparkle_mask(spark_ang, spark_sep, reference_image, wavelength=wavelength)
         masked_reference_image = reference_image * mask_image
         # save the reduced images
         fr._save_fits_primary_float32(reference_image, reference_image_path)
@@ -173,35 +179,76 @@ def create_reference_image(unsats_dir, unsats_nospark_dir):
     # if we don't have any files, error
     else:
         raise ValueError(f"No unsats or unsats_nospark files found in {unsats_dir} and {unsats_nospark_dir}")
+    # normalize the reference image
+    reference_image = reference_image / np.mean(reference_image)
     return reference_image
 
-def make_sparkle_mask(spark_ang, spark_sep, ex_data, camsci_grid, width_r_ld=8, width_phi_rld=3):
-    '''
-    Making a mask based on expected location of the sparkles
-    '''
-    # building up the elipises 
-    spark_sep_as = 0.92 * rc.spark_to_dist(spark_sep, wavelength=908e-9) #as
-    angs = np.deg2rad(np.array([spark_ang-90*i for i in range(4)]))
-    centers_x = np.array([spark_sep_as * np.cos(ang) for ang in angs])
-    centers_y = np.array([spark_sep_as * np.sin(ang) for ang in angs])
-    centers = list(zip(centers_y, centers_x))
-    width_r = LAM_D_AS * width_r_ld
-    width_phi = LAM_D_AS * width_phi_rld
-    diameters = [(width_r, width_phi) for i in range(4)]
-    # iteratively build up the mask
-    ap_total = np.zeros_like(ex_data.ravel())
-    for i in range(4):
-        ap_temp = evaluate_supersampled(make_elliptical_aperture(diameters[i], centers[i], angs[i]+np.pi/2), camsci_grid, 4)
-        ap_total += ap_temp
-    # soften these with the tukey window
-    taper = TukeyWindow(alpha=0.4)
-    window_data = taper((27, 27))
-    sof_mask = scipy.signal.convolve2d(ap_total.reshape(camsci_grid.dims), window_data, mode = 'same')
-    sof_mask/= np.max(sof_mask)
-    soft_mask_field = Field(sof_mask.ravel(), camsci_grid)
-    return soft_mask_field
-
 ################### STEP 2 ###################
+
+def center_pool(file_table, file_table_output, ref_image, mask, grid, params, max_files=-1, chunk_size=100):
+    '''
+    Allocates file centering in chunks
+    '''
+    #TODO: need to only consider the file in "to_use" bin
+    # in this list of indexes, should only be one dark
+    # make sure that the data pulled is cleaned before it's used 
+
+    # List of file indexes that have the right parameters 
+    file_table_total = _ephemeral_file_table_with_to_use(file_table, file_table_output)
+    all_idxs = np.arange(len(file_table_total))
+    used_idxs = all_idxs[file_table_total["to_use"] == 1]
+    no_files = len(used_idxs)
+    # sanitize the max_files input
+    if max_files == -1:
+        max_files = no_files
+    elif max_files > no_files:
+        max_files = no_files
+    num_chunks = max_files // chunk_size + 1
+    # TODO: optionally parallelize this
+    for i in range(num_chunks):
+        # if it's the last chunk, get the remaining files
+        if i == num_chunks - 1:
+            idxs = np.arange(i*chunk_size, no_files)
+        else:
+            idxs = np.arange(i*chunk_size, (i+1)*chunk_size)
+        # RUN THE CENTERING FUNCTION
+        shifts = center_chunk(file_table, idxs, ref_image, mask, grid, params)
+        # Write the shifts to the file table output
+        file_table_output["shift_y"][idxs] = shifts[:, 0]
+        file_table_output["shift_x"][idxs] = shifts[:, 1]
+        # Update the file table output
+        # TODO: implement generic updates to the file table output
+        file_table_output = fr.update_file_table_output(file_table_output, idxs, shifts)
+    return file_table_output
+
+def center_chunk(file_table, idxs, ref_image, mask, grid, params):
+    '''
+    Calls the registration code in center_spark.py
+    idxs is a list of indicies in the file table to center 
+    '''
+    # load the data - this does the name resolution
+    data_cube = data_cube_fom_idxs(file_table, idxs, params)
+    # call the registration code
+    shifts = cs.register_files_fft(data_cube, ref_image, mask, grid)
+    # TODO: should I also resave the data shifted? does it need to have it's original headers? 
+    return shifts
+
+def data_cube_fom_idxs(file_table_static, idxs, params):
+    # pul the path parameters
+    obs_path = params["obs_path"]
+    unsats_dir = params["unsats_dir"]
+    camera = params["camera"]
+    # pull the files related to the idxs
+    used = file_table_static[idxs]
+    prefix = f"{obs_path}{unsats_dir}/{camera}/"
+    unsat_files = [prefix + str(fn) for fn in used["filename"]]
+    # 1.1 pull dark data
+    dark_path = used["masterdark_path"][0]
+    dark_data = fr._load_fits_primary_float32(dark_path)
+    # 1.2 pulling all files and making cube
+    unsats_data_cube = fr.make_data_cube(unsat_files, dark_data)
+    return unsats_data_cube
+
 
 
 #############################################################
