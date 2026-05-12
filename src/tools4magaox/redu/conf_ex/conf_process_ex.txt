@@ -1,0 +1,19 @@
+# This is an example of a process data conf file
+# use only one data dir per file to ensure specific enough filter params
+
+obs_path = "/Volumes/magaox_bpic/2025B/"
+redu_path = "/Volumes/magaox_bpic/redu/"
+masterdark_dir = "/Volumes/magaox_bpic/redu/"
+
+data_dir = "2025-12-02_062543_beta_pic_coron_lg"
+unsats_dir = "2025-12-01_081206_beta_pic_piaa_unsats"
+unsats_nospark_dir = "2025-12-01_081737_beta_pic_piaa_unsats_nospark"
+
+cameras = ["camsci1", "camsci2"]
+
+# required params
+spark_ang = 0
+spark_sep = 20
+
+# optional params
+max_files
