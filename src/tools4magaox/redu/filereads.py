@@ -172,6 +172,8 @@ def init_file_table_output(full_table):
     out["pass_majority_config"] = to_use.copy()
     out["shift_x"] = np.full(n, np.nan, dtype=float)
     out["shift_y"] = np.full(n, np.nan, dtype=float)
+    out["recenter_shift_x"] = np.full(n, np.nan, dtype=float)
+    out["recenter_shift_y"] = np.full(n, np.nan, dtype=float)
     out["center_stack_id"] = np.full(n, -1, dtype=int)
     out["max_point_radius"] = np.full(n, np.nan, dtype=float)
     out["speckle_intensity"] = np.full(n, np.nan, dtype=float)
@@ -185,6 +187,8 @@ PROCESS_FILE_TABLE_OUTPUT_COLUMNS = (
     "pass_majority_config",
     "shift_x",
     "shift_y",
+    "recenter_shift_x",
+    "recenter_shift_y",
     "center_stack_id",
     "max_point_radius",
     "speckle_intensity",
@@ -195,6 +199,8 @@ PROCESS_FILE_TABLE_OUTPUT_COLUMNS = (
 
 _PROCESS_FILTER_COLUMNS = {
     "center_stack_id": ("int", -1),
+    "recenter_shift_x": ("float", np.nan),
+    "recenter_shift_y": ("float", np.nan),
     "max_point_radius": ("float", np.nan),
     "speckle_intensity": ("float", np.nan),
     "rms_deviation": ("float", np.nan),
@@ -229,7 +235,13 @@ def ephemeral_file_table_with_to_use(file_table_static, file_table_output):
     return t
 
 
-def update_file_table_output(file_table_output, row_indices, shifts, center_stack_id=None):
+def update_file_table_output(
+    file_table_output,
+    row_indices,
+    shifts,
+    center_stack_id=None,
+    shift_cols=("shift_y", "shift_x"),
+):
     """
     Write registration shifts for rows in the full output table.
 
@@ -244,7 +256,10 @@ def update_file_table_output(file_table_output, row_indices, shifts, center_stac
         ``[shift_y, shift_x]`` (same order as :func:`center_spark.register_files_fft`).
     center_stack_id : int, optional
         Stack index when frames were coadded for centering (same value for every
-        row in ``row_indices``).
+        row in ``row_indices``). Only written to ``center_stack_id`` when
+        ``shift_cols`` is the default first-pass pair.
+    shift_cols : tuple of str
+        Column names ``(shift_y_col, shift_x_col)`` to update.
     """
     rows = np.asarray(row_indices, dtype=int).ravel()
     s = np.asarray(shifts, dtype=float)
@@ -254,9 +269,10 @@ def update_file_table_output(file_table_output, row_indices, shifts, center_stac
         raise ValueError(
             f"shifts length {s.shape[0]} != number of row indices {rows.size}"
         )
-    file_table_output["shift_y"][rows] = s[:, 0]
-    file_table_output["shift_x"][rows] = s[:, 1]
-    if center_stack_id is not None:
+    sy_col, sx_col = shift_cols
+    file_table_output[sy_col][rows] = s[:, 0]
+    file_table_output[sx_col][rows] = s[:, 1]
+    if center_stack_id is not None and shift_cols == ("shift_y", "shift_x"):
         file_table_output["center_stack_id"][rows] = int(center_stack_id)
     return file_table_output
 
