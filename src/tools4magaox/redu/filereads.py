@@ -4,10 +4,15 @@
 import glob
 import logging
 import os
+from collections import Counter
 from tqdm import trange, tqdm
 from astropy.table import Table
-import darks as md
-from darks import _detect_camera_tag_from_header
+try:
+    from . import darks as md
+    from .darks import _detect_camera_tag_from_header
+except ImportError:
+    import darks as md
+    from darks import _detect_camera_tag_from_header
 
 from astropy.io import fits
 import numpy as np
@@ -86,31 +91,187 @@ def attach_masterdarks(file_table, dark_search_dir, camera):
     return md.merge_file_table_with_darks(file_table, dark_dictionary)
 
 
-def init_process_output_table():
+def _coerce_hdr_number(value):
+    """Parse a numeric FITS header value; missing or invalid -> NaN."""
+    if value is None:
+        return np.nan
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return np.nan
+    return out if np.isfinite(out) else np.nan
+
+
+def _config_key_part(value, col):
+    """Hashable config value for majority grouping (missing values match)."""
+    if col == "camera":
+        return str(value)
+    if value is None:
+        return None
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return None
+    return None if not np.isfinite(v) else v
+
+
+def pick_majority_config(file_table):
     """
-    Zero-row manifest of process-pipeline outputs to populate as steps run.
+    Find the detector configuration that appears in the most files.
+
+    Returns a copy of ``file_table`` with a ``to_use`` column: 1 if the file
+    matches the majority configuration, else 0.
     """
-    out = Table()
-    out["step"] = np.array([], dtype=int)
-    out["product"] = np.array([], dtype="U64")
-    out["source_filename"] = np.array([], dtype="U256")
-    out["path"] = np.array([], dtype="U1024")
-    out["status"] = np.array([], dtype="U32")
-    out["notes"] = np.array([], dtype="U256")
+    cfg_cols = (
+        "camera",
+        "NAXIS1",
+        "NAXIS2",
+        "ROI_XCEN",
+        "ROI_YCEN",
+        "EMGAIN",
+        "ADC_SPEED",
+        "EXPTIME",
+    )
+    missing = [c for c in cfg_cols if c not in file_table.colnames]
+    if missing:
+        raise ValueError(
+            f"file_table missing required columns for majority picking: {missing}"
+        )
+
+    if len(file_table) == 0:
+        out = file_table.copy()
+        out["to_use"] = np.array([], dtype=int)
+        return out
+
+    keys = [
+        tuple(_config_key_part(file_table[col][i], col) for col in cfg_cols)
+        for i in range(len(file_table))
+    ]
+    majority_key = Counter(keys).most_common(1)[0][0]
+    mask = np.array([k == majority_key for k in keys], dtype=bool)
+
+    out = file_table.copy()
+    out["to_use"] = mask.astype(int)
     return out
+
+
+def file_table_static_from_full(full_table):
+    """Telemetry + masterdark only (no pipeline filter columns)."""
+    cols = [c for c in full_table.colnames if c != "to_use"]
+    return full_table[cols].copy()
+
+
+def init_file_table_output(full_table):
+    """
+    One row per file: majority filter plus placeholders for process pipeline outputs.
+    """
+    n = len(full_table)
+    to_use = np.asarray(full_table["to_use"], dtype=int)
+    out = Table()
+    out["filename"] = full_table["filename"].copy()
+    out["pass_majority_config"] = to_use.copy()
+    out["shift_x"] = np.full(n, np.nan, dtype=float)
+    out["shift_y"] = np.full(n, np.nan, dtype=float)
+    out["center_stack_id"] = np.full(n, -1, dtype=int)
+    out["max_point_radius"] = np.full(n, np.nan, dtype=float)
+    out["speckle_intensity"] = np.full(n, np.nan, dtype=float)
+    out["rms_deviation"] = np.full(n, np.nan, dtype=float)
+    out["used_in_reduction"] = np.zeros(n, dtype=int)
+    return out
+
+
+PROCESS_FILE_TABLE_OUTPUT_COLUMNS = (
+    "filename",
+    "pass_majority_config",
+    "shift_x",
+    "shift_y",
+    "center_stack_id",
+    "max_point_radius",
+    "speckle_intensity",
+    "rms_deviation",
+    "used_in_reduction",
+)
+
+
+_PROCESS_FILTER_COLUMNS = {
+    "center_stack_id": ("int", -1),
+    "max_point_radius": ("float", np.nan),
+    "speckle_intensity": ("float", np.nan),
+    "rms_deviation": ("float", np.nan),
+    "used_in_reduction": ("int", 0),
+}
+
+
+def ensure_process_filter_columns(file_table_output):
+    """Add process step-4 filter columns if loading an older output table."""
+    n = len(file_table_output)
+    for col, (kind, default) in _PROCESS_FILTER_COLUMNS.items():
+        if col in file_table_output.colnames:
+            continue
+        if kind == "float":
+            file_table_output[col] = np.full(n, default, dtype=float)
+        else:
+            file_table_output[col] = np.full(n, default, dtype=int)
+    return file_table_output
+
+
+def prune_process_output_table(file_table_output):
+    """Return a copy with only columns used by the process pipeline."""
+    file_table_output = ensure_process_filter_columns(file_table_output)
+    keep = [c for c in PROCESS_FILE_TABLE_OUTPUT_COLUMNS if c in file_table_output.colnames]
+    return file_table_output[keep].copy()
+
+
+def ephemeral_file_table_with_to_use(file_table_static, file_table_output):
+    """Static roster plus synthetic ``to_use`` from ``pass_majority_config``."""
+    t = file_table_static.copy()
+    t["to_use"] = np.asarray(file_table_output["pass_majority_config"], dtype=int)
+    return t
+
+
+def update_file_table_output(file_table_output, row_indices, shifts, center_stack_id=None):
+    """
+    Write registration shifts for rows in the full output table.
+
+    Parameters
+    ----------
+    file_table_output : astropy.table.Table
+        Table from :func:`init_file_table_output`.
+    row_indices : array-like of int
+        Row indices in ``file_table_output`` (full roster, not chunk-local).
+    shifts : array-like, shape (N, 2)
+        Per-frame correction shifts in pixels for ``scipy.ndimage.shift``, columns
+        ``[shift_y, shift_x]`` (same order as :func:`center_spark.register_files_fft`).
+    center_stack_id : int, optional
+        Stack index when frames were coadded for centering (same value for every
+        row in ``row_indices``).
+    """
+    rows = np.asarray(row_indices, dtype=int).ravel()
+    s = np.asarray(shifts, dtype=float)
+    if s.ndim != 2 or s.shape[1] != 2:
+        raise ValueError(f"shifts must have shape (N, 2), got {s.shape}")
+    if s.shape[0] != rows.size:
+        raise ValueError(
+            f"shifts length {s.shape[0]} != number of row indices {rows.size}"
+        )
+    file_table_output["shift_y"][rows] = s[:, 0]
+    file_table_output["shift_x"][rows] = s[:, 1]
+    if center_stack_id is not None:
+        file_table_output["center_stack_id"][rows] = int(center_stack_id)
+    return file_table_output
 
 
 def pull_hdr_params(hdr, camera, darks=True):
     vals = {
             "DATE_OBS": hdr.get("DATE-OBS"),
-            "PARANG": hdr.get("PARANG"),
-            "NAXIS1": _find_hdr_val(hdr, "NAXIS1"),
-            "NAXIS2": _find_hdr_val(hdr, "NAXIS2"),
-            "ROI_XCEN": _find_hdr_val(hdr, "ROI_XCEN", camera_tag=camera),
-            "ROI_YCEN": _find_hdr_val(hdr, "ROI_YCEN", camera_tag=camera),
-            "EMGAIN": _find_hdr_val(hdr, "EMGAIN", camera_tag=camera),
-            "ADC_SPEED": _find_hdr_val(hdr, "ADC SPEED", camera_tag=camera),
-            "EXPTIME": _find_hdr_val(hdr, "EXPTIME", camera_tag=camera),
+            "PARANG": _coerce_hdr_number(hdr.get("PARANG")),
+            "NAXIS1": _coerce_hdr_number(_find_hdr_val(hdr, "NAXIS1")),
+            "NAXIS2": _coerce_hdr_number(_find_hdr_val(hdr, "NAXIS2")),
+            "ROI_XCEN": _coerce_hdr_number(_find_hdr_val(hdr, "ROI_XCEN", camera_tag=camera)),
+            "ROI_YCEN": _coerce_hdr_number(_find_hdr_val(hdr, "ROI_YCEN", camera_tag=camera)),
+            "EMGAIN": _coerce_hdr_number(_find_hdr_val(hdr, "EMGAIN", camera_tag=camera)),
+            "ADC_SPEED": _coerce_hdr_number(_find_hdr_val(hdr, "ADC SPEED", camera_tag=camera)),
+            "EXPTIME": _coerce_hdr_number(_find_hdr_val(hdr, "EXPTIME", camera_tag=camera)),
             "SHUTTER": _find_hdr_val(hdr, "SHUTTER", camera_tag=camera),
         }
     return vals
@@ -137,8 +298,7 @@ def fits_telemetry_table(file_paths, camera=None):
     astropy.table.Table
         Columns: ``filename``, ``camera``, ``DATE_OBS``, ``PARANG``, ``NAXIS1``,
         ``NAXIS2``, ``ROI_XCEN``, ``ROI_YCEN``, ``EMGAIN``, ``ADC_SPEED``,
-        ``EXPTIME``, ``SHUTTER``. Missing ``PARANG`` is stored as NaN; missing
-        optional keywords are None.
+        ``EXPTIME``, ``SHUTTER``. Missing numeric keywords are stored as NaN.
     """
 
     if isinstance(file_paths, (str, os.PathLike)):
@@ -288,15 +448,90 @@ def make_science_cube_coadd(file_list, dark_data, coadd=10, n_files=-1, n_start=
 
 # We don't want to do this by file number anymore, we might have large chunks of time missing
 # this is the best way to make sure the images themselves don't get blurred
+def coadd_by_frames(data, parang_cube, time_cube, frame_coadd=10):
+    """
+    Mean-coadd consecutive frames in groups of ``frame_coadd``.
+
+    Parameters
+    ----------
+    data : ndarray, shape (N, H, W)
+    parang_cube : ndarray, shape (N,)
+    time_cube : array-like of observation times
+    frame_coadd : int
+        Number of consecutive frames per output slice.
+
+    Returns
+    -------
+    data_out, parang_out, time_out
+    """
+    data = np.asarray(data, dtype=np.float32)
+    parang_cube = np.asarray(parang_cube, dtype=float)
+    times = _coerce_times_to_datetime64(time_cube)
+    n = len(data)
+    frame_coadd = max(1, int(frame_coadd))
+    n_out = n // frame_coadd
+    if n_out == 0:
+        raise ValueError(
+            f"coadd_by_frames: need at least {frame_coadd} frames, got {n}"
+        )
+    h, w = data.shape[1], data.shape[2]
+    data_out = np.zeros((n_out, h, w), dtype=np.float32)
+    parang_out = np.zeros(n_out, dtype=float)
+    time_out = np.full(n_out, np.datetime64("NaT"), dtype="datetime64[us]")
+    for i in range(n_out):
+        sl = slice(i * frame_coadd, (i + 1) * frame_coadd)
+        data_out[i] = np.mean(data[sl], axis=0, dtype=np.float64)
+        parang_out[i] = np.mean(parang_cube[sl])
+        time_out[i] = times[sl.start]
+    return data_out, parang_out, time_out
+
+
 def coadd_by_time(data, time_cube, parang_cube, time_coadd=10):
     """
-    We want to stack cubes by time, suggestion is 10s
-    :param data: Description
-    :param time_cube: Description
-    :param parang_cube: Description
+    Mean-coadd consecutive frames into groups spanning at least ``time_coadd`` seconds.
+
+    Parameters
+    ----------
+    data : ndarray, shape (N, H, W)
+    time_cube : array-like of observation times
+    parang_cube : ndarray, shape (N,)
+    time_coadd : float
+        Minimum elapsed time (seconds) covered by each coadd group.
+
+    Returns
+    -------
+    data_out, parang_out, time_out
     """
-    # TODO
-    pass
+    data = np.asarray(data, dtype=np.float32)
+    parang_cube = np.asarray(parang_cube, dtype=float)
+    times = _coerce_times_to_datetime64(time_cube)
+    n = len(data)
+    if n == 0:
+        return data, parang_cube, times
+    time_coadd = float(time_coadd)
+    if time_coadd <= 0:
+        raise ValueError(f"time_coadd must be positive, got {time_coadd}")
+
+    groups = []
+    start = 0
+    for i in range(1, n):
+        dt_sec = (times[i] - times[start]) / np.timedelta64(1, "s")
+        if float(dt_sec) >= time_coadd:
+            groups.append((start, i))
+            start = i
+    if start < n:
+        groups.append((start, n))
+
+    h, w = data.shape[1], data.shape[2]
+    n_out = len(groups)
+    data_out = np.zeros((n_out, h, w), dtype=np.float32)
+    parang_out = np.zeros(n_out, dtype=float)
+    time_out = np.full(n_out, np.datetime64("NaT"), dtype="datetime64[us]")
+    for i, (a, b) in enumerate(groups):
+        data_out[i] = np.mean(data[a:b], axis=0, dtype=np.float64)
+        parang_out[i] = np.mean(parang_cube[a:b])
+        time_out[i] = times[a]
+    return data_out, parang_out, time_out
 
 
 ############## File checking functions ###############

@@ -18,10 +18,16 @@ from scipy import ndimage
 import scipy
 
 from tools4magaox.constants import *
-import darks as md
-import filtering as fl
-import filereads as fr
-import centering as ct
+try:
+    from . import darks as md
+    from . import filtering as fl
+    from . import filereads as fr
+    from . import centering as ct
+except ImportError:
+    import darks as md
+    import filtering as fl
+    import filereads as fr
+    import centering as ct
 
 log = logging.getLogger(__name__)
 

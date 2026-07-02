@@ -288,7 +288,10 @@ def lookup_masterdarks_from_telemetry_table(
         One entry per unique config, with keys matching the masterdark match
         dict plus ``masterdark_paths`` (list of str).
     """
-    from darks import find_masterdark_for_params
+    try:
+        from .darks import find_masterdark_for_params
+    except ImportError:
+        from darks import find_masterdark_for_params
 
     redu_dir = _require_masterdark_search_dir(redu_dir)
     uniq = unique_telemetry_configs_for_dark_lookup(table, camera=camera)
