@@ -7,7 +7,10 @@ import os
 import matplotlib.pyplot as plt
 import numpy as np
 
-from filereads import _coerce_times_to_datetime64
+try:
+    from .filereads import _coerce_times_to_datetime64
+except ImportError:
+    from filereads import _coerce_times_to_datetime64
 
 log = logging.getLogger(__name__)
 
@@ -90,6 +93,129 @@ def filter_unstat_shifts(shifts, px_max=10, rolling_avg_window=-1):
         idx_hi,
     )
     return good_indexes
+
+#################### process filter functions ####################
+
+def filter_max_point(data_cube, sigma_clip=2.0):
+    """
+    Keep frames whose brightest-pixel position is within ``sigma_clip`` std of the
+    mean radial offset (process ``filter_max_point``).
+    """
+    from numpy import unravel_index
+
+    data_cube = np.asarray(data_cube)
+    n = data_cube.shape[0]
+    if n == 0:
+        return np.array([], dtype=bool), np.array([], dtype=float)
+    peak_idxs = np.array([unravel_index(frame.argmax(), frame.shape) for frame in data_cube])
+    return filter_max_point_from_peak_idxs(peak_idxs, sigma_clip=sigma_clip)
+
+
+def filter_max_point_from_peak_idxs(peak_idxs, sigma_clip=2.0):
+    """Apply max-point filter from precomputed ``(N, 2)`` peak pixel indices."""
+    peak_idxs = np.asarray(peak_idxs, dtype=float)
+    n = peak_idxs.shape[0]
+    if n == 0:
+        return np.array([], dtype=bool), np.array([], dtype=float)
+    means = np.mean(peak_idxs, axis=0)
+    radius_sq = (peak_idxs[:, 0] - means[0]) ** 2 + (peak_idxs[:, 1] - means[1]) ** 2
+    threshold = np.mean(radius_sq) + sigma_clip * np.std(radius_sq)
+    pass_mask = radius_sq <= threshold
+    log.info(
+        "filter_max_point: sigma_clip=%s kept %s/%s frames",
+        sigma_clip,
+        int(np.sum(pass_mask)),
+        n,
+    )
+    return pass_mask, np.sqrt(radius_sq, dtype=float)
+
+
+def filter_center_shifts(shifts, sigma_clip=2.0):
+    """
+    Keep frames with shift_y and shift_x within ``sigma_clip`` std of the mean
+    (process ``filter_center_shifts``; shifts are ``[shift_y, shift_x]``).
+    """
+    shifts = np.asarray(shifts, dtype=float)
+    n = shifts.shape[0]
+    if n == 0:
+        return np.array([], dtype=bool)
+    sy = shifts[:, 0]
+    sx = shifts[:, 1]
+    sy_mean, sy_std = np.mean(sy), np.std(sy)
+    sx_mean, sx_std = np.mean(sx), np.std(sx)
+    pass_y = (sy > sy_mean - sigma_clip * sy_std) & (sy < sy_mean + sigma_clip * sy_std)
+    pass_x = (sx > sx_mean - sigma_clip * sx_std) & (sx < sx_mean + sigma_clip * sx_std)
+    pass_mask = pass_y & pass_x
+    log.info(
+        "filter_center_shifts: sigma_clip=%s kept %s/%s frames",
+        sigma_clip,
+        int(np.sum(pass_mask)),
+        n,
+    )
+    return pass_mask
+
+
+def filter_speckle_intensity(data_centered, speckle_mask, sigma_clip=2.0):
+    """
+    Keep frames whose masked speckle sum is within ``sigma_clip`` std of the mean.
+    """
+    data_centered = np.asarray(data_centered)
+    if hasattr(speckle_mask, "shaped"):
+        mask = np.asarray(speckle_mask.shaped, dtype=float)
+    else:
+        mask = np.asarray(speckle_mask, dtype=float)
+    intensities = np.sum(data_centered * mask, axis=(1, 2))
+    return filter_speckle_intensity_values(intensities, sigma_clip=sigma_clip)
+
+
+def filter_speckle_intensity_values(intensities, sigma_clip=2.0):
+    """Apply speckle-intensity filter from precomputed per-frame sums."""
+    intensities = np.asarray(intensities, dtype=float)
+    n = intensities.size
+    if n == 0:
+        return np.array([], dtype=bool), np.array([], dtype=float)
+    i_mean = np.mean(intensities)
+    i_std = np.std(intensities)
+    pass_mask = (intensities > i_mean - sigma_clip * i_std) & (
+        intensities < i_mean + sigma_clip * i_std
+    )
+    log.info(
+        "filter_speckle_intensity: sigma_clip=%s kept %s/%s frames",
+        sigma_clip,
+        int(np.sum(pass_mask)),
+        n,
+    )
+    return pass_mask, intensities
+
+
+def filter_rms(data_cube, sigma_clip=2.0, n_iter=3):
+    """
+    Iteratively reject frames with high RMS residual vs the mean of survivors.
+    """
+    data_cube = np.asarray(data_cube)
+    n = data_cube.shape[0]
+    if n == 0:
+        return np.array([], dtype=bool), np.array([], dtype=float)
+    idx = np.ones(n, dtype=bool)
+    rms_deviations = np.full(n, np.nan, dtype=float)
+    for _ in range(n_iter):
+        if not np.any(idx):
+            break
+        good_frame = np.mean(data_cube[idx], axis=0)
+        rms_deviations = np.array(
+            [float(np.std(frame - good_frame)) for frame in data_cube], dtype=float
+        )
+        ref = np.median(rms_deviations)
+        spread = np.std(rms_deviations)
+        idx = rms_deviations <= ref + sigma_clip * spread
+    log.info(
+        "filter_rms: sigma_clip=%s n_iter=%s kept %s/%s frames",
+        sigma_clip,
+        n_iter,
+        int(np.sum(idx)),
+        n,
+    )
+    return idx, rms_deviations
 
 #################### plot functions ####################
 
@@ -206,3 +332,30 @@ def plot_shift_filter_scatter(shifts, good_idxs, px_max=10, plot_path="", plt_na
     plt.close()
     log.info("Saved shift filter scatter plot to %s", scatter_file)
     return
+
+def plot_reference_and_mask(
+    reference_image,
+    mask_image,
+    plot_path="",
+    plt_name="1_reference_mask.png",
+):
+    """Side-by-side reference image and sparkle mask (process step 1)."""
+    ny, nx = reference_image.shape
+    x0, y0 = nx / 2, ny / 2
+
+    obs_name = plot_path.split("/")[-2] + " " + plot_path.split("/")[-3]
+    fig, axes = plt.subplots(1, 2, figsize=(10, 5))
+    axes[0].imshow(mask_image, origin="lower", cmap="gray")
+    axes[0].set_title("Sparkle mask")
+    axes[0].axis("off")
+    axes[1].imshow(reference_image, origin="lower", cmap="gray")
+    axes[1].axvline(x0, color="cyan", lw=0.8, ls=":")
+    axes[1].axhline(y0, color="cyan", lw=0.8, ls=":")
+    axes[1].set_title("Reference image masked")
+    axes[1].axis("off")
+    fig.suptitle(f"Process reference and mask\n{obs_name}")
+    fig.tight_layout()
+    out = os.path.join(plot_path, plt_name) if plot_path else plt_name
+    fig.savefig(out)
+    plt.close(fig)
+    log.info("Saved reference/mask plot to %s", out)

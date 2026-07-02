@@ -1,9 +1,8 @@
 # This is an example preprocess configuration file 
 # use only one unsats dir per conf to specify filter params
 
-obs_path = "/Volumes/magaox_bpic/edenmcewen@arizona.edu/"
+obs_path = "/Volumes/magaox_bpic/2025B/"
 redu_path = "/Volumes/magaox_bpic/redu/"
-# Root directory for recursive search of *masterdark*.fits* (optional; defaults to redu_path)
 masterdark_dir = "/Volumes/magaox_bpic/redu/"
 
 unsats_dir = "2025-12-01_081206_beta_pic_piaa_unsats"
@@ -16,4 +15,8 @@ fit_func = "gauss_min"
 
 max_files = -1
 pct_cut = 20
+gauss_amp_pct_cut = 20
+
+# Optional: crop used for gaussian centering fits in step 2 (height, width)
+crop_shape = (64, 64)
 

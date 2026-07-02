@@ -10,6 +10,7 @@ from scipy import ndimage
 import numpy as np
 import scipy.signal
 from tools4magaox.constants import *
+from photutils.psf.matching import TukeyWindow
 
 ########## Dang I guess I'm using HCIPy #############
 
@@ -82,34 +83,54 @@ def hpf_array(data, sigma):
     '''
     return data - ndimage.gaussian_filter(data,sigma)
 
-    # want to convolve the data cube with the masked sparkles... 
+
+# want to convolve the data cube with the masked sparkles... 
 def register_files_fft(science_cube, ref_image, mask, grid):
     '''
-    Science_cube is a 3D array
+    Science_cube is a 3D array of shape (N, H, W)
     Ref_image is a 2D array
-    Mask is a Field object
+    Mask is a Field object or 2D array on ``grid``
     Grid is a Grid object
     '''
-    #reference_image = np.median(science_cube, axis=0)
-    # set up fourier transforms 
+    science_cube = np.asarray(science_cube)
+    n_frames = science_cube.shape[0]
+    if isinstance(mask, Field):
+        mask_arr = np.asarray(mask.shaped).ravel()
+    else:
+        mask_arr = np.asarray(mask).ravel()
+
     ft_in = FastFourierTransform(grid)
-    fft_grid = ft_in.output_grid
-    sample_grid = make_pupil_grid(480, 20.0) # dims, diameter | subsampling, pixels 
-    ft_out = MatrixFourierTransform(sample_grid, ft_in.output_grid)
-    # high pass filter the data cube
-    data_cube_hpf = Field(np.array([hpf_array(dc, sigma=10) for dc in science_cube]), grid)
+    ft_out = MatrixFourierTransform(
+        make_pupil_grid(480, 0.10), ft_in.output_grid
+    )
+    sample_grid = ft_out.input_grid
 
-    # Frames shifted
-    ref_kernel = np.conj(ft_in.forward(ref_image + 0j))
-    fourier_sci = ft_in.forward(data_cube_hpf*mask + 0j)
-    # calculate shifts with max of fourier space convolution
-    sci_xcorr = np.real(ft_out.backward(fourier_sci * ref_kernel))
-    sci_grid_shifts = np.array([sample_grid.points[ai] for ai in np.argmax(sci_xcorr, axis=-1)])
-    # generate and use the shift kernel 
+    ref_field = Field(np.asarray(ref_image).ravel(), grid)
+    ref_kernel = np.conj(ft_in.forward(ref_field + 0j))
 
-    # Return shifts instead of the shifted data
-    #c_y = sci_grid_shifts[:, 0]
-    #c_x = sci_grid_shifts[:, 1]
-    #shifted_sci = Field([ndimage.shift(science_cube[i], (c_y[i], c_x[i])).ravel()  for i in range(science_cube.shape[0])], grid)
-
-    return sci_grid_shifts
+    # One row per frame: shape (N, grid.size). A (N, H, W) Field is interpreted
+    # as a higher-order tensor (N, H) layers, not N scalar frames.
+    hpf_flat = np.stack(
+        [hpf_array(frame, sigma=10).ravel() * mask_arr for frame in science_cube],
+        axis=0,
+    )
+    # make the data cube a field
+    data_cube_hpf = Field(hpf_flat, grid)
+    # take the FFT to decide ideal centers
+    fourier_sci = ft_in.forward(data_cube_hpf + 0j)
+    # cross correlate the data cube with the reference image
+    xcorr = np.real(ft_out.backward(fourier_sci * ref_kernel))
+    # reshape the xcorr to be a 2D array
+    xcorr = np.asarray(xcorr).reshape(n_frames, -1) 
+    # find the peak index in the xcorr
+    peak_idx = np.argmax(xcorr, axis=-1)
+    pts = sample_grid.points[peak_idx]
+    delta = np.atleast_1d(np.asarray(grid.delta, dtype=float))
+    if delta.size == 1:
+        delta = np.full(2, float(delta[0]))
+    # MFT peaks are in HCIPy grid coords (dim0, dim1). ``ndimage.shift`` expects
+    # (axis0, axis1) matching ``field.shaped`` — swap components and negate to get
+    # the correction that aligns science to the reference (see shift_field in centering.py).
+    shift_y = -pts[:, 1] / delta[1]
+    shift_x = -pts[:, 0] / delta[0]
+    return np.column_stack([shift_y, shift_x])

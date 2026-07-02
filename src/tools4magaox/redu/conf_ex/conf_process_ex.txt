@@ -5,15 +5,34 @@ obs_path = "/Volumes/magaox_bpic/2025B/"
 redu_path = "/Volumes/magaox_bpic/redu/"
 masterdark_dir = "/Volumes/magaox_bpic/redu/"
 
-data_dir = "2025-12-02_062543_beta_pic_coron_lg"
-unsats_dir = "2025-12-01_081206_beta_pic_piaa_unsats"
-unsats_nospark_dir = "2025-12-01_081737_beta_pic_piaa_unsats_nospark"
+data_dir = "2025-12-02_070348_beta_pic_coron_lg"
+unsats_dir = "2025-12-02_065035_beta_pic_coron_lg_unsats"
+unsats_nospark_dir = "2025-12-02_065549_beta_pic_coron_lg_unsats_nospark"
 
 cameras = ["camsci1", "camsci2"]
 
-# required params
+# sparkle mask (step 1); order matches ``cameras`` when a list
 spark_ang = 0
 spark_sep = 20
+wavelength = [908e-9, 615e-9]
 
 # optional params
-max_files
+plot = True
+force_rerun = True
+max_files = -1
+chunk_size = 100
+center_coadd_n = 1
+
+# per-step / per-filter plots (default to ``plot`` when omitted)
+plot_reference = True
+plot_max_point = True
+plot_center_shift = True
+plot_speckle_intensity = True
+plot_rms = True
+
+# step 4 process filters (sigma clip cutoffs)
+max_point_sigma_clip = 2
+shift_sigma_clip = 2
+speckle_intensity_sigma_clip = 2
+rms_sigma_clip = 2
+rms_iterations = 3
