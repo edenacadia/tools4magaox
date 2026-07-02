@@ -70,10 +70,18 @@ def process_main(run_params):
     )
     # STEP 3
     s3_save_centered_images(run_params, file_table_static, file_table_output)
+    # STEP 2b (optional second-pass centering on centered frames)
+    file_table_output = s2b_recenter(
+        run_params, file_table_static, file_table_output, masked_reference_image, mask_image
+    )
+    # OPTIONAL STEP 3b
+    s3b_save_first_centered_cube(run_params, file_table_static, file_table_output)
     # STEP 4
     file_table_output = s4_save_statistics(
         run_params, file_table_static, file_table_output, mask_image
     )
+    # OPTIONAL STEP 4b
+    s4b_save_filtered_centered_cube(run_params, file_table_static, file_table_output)
     return True
 
 # STEP 0 - File tables
@@ -159,18 +167,37 @@ def s1_create_reference(run_params):
         log.info("=> LOADING REF IMAGE")
         masked_reference_image = fr._load_fits_primary_float32(masked_reference_image_path)
         mask_image = fr._load_fits_primary_float32(mask_image_path)
+        # Backward compatibility: older runs may have saved the mask as a 1D
+        # flattened array. Reshape it to 2D so downstream broadcasting works.
+        if getattr(mask_image, "ndim", 0) == 1:
+            target_shape = masked_reference_image.shape
+            if int(np.prod(target_shape)) == int(mask_image.size):
+                mask_image = np.asarray(mask_image, dtype=np.float32).reshape(target_shape)
+            else:
+                raise ValueError(
+                    f"Loaded mask is 1D (len={mask_image.size}) but cannot reshape to "
+                    f"masked_reference_image shape {target_shape}"
+                )
     else:
         log.info("=> CREATING REF IMAGE")
         # check to see if average image has been made already
         reference_image = create_reference_image(unsats_path, unsats_nospark_path)
-        mask_image = cs.make_sparkle_mask(spark_ang, spark_sep, reference_image, wavelength=wavelength)
-        masked_reference_image = reference_image * mask_image.shaped
+        mask_field = cs.make_sparkle_mask(
+            spark_ang, spark_sep, reference_image, wavelength=wavelength
+        )
+        # Persist mask as a plain 2D array for downstream compatibility.
+        mask_image = (
+            np.asarray(mask_field.shaped, dtype=np.float32)
+            if hasattr(mask_field, "shaped")
+            else np.asarray(mask_field, dtype=np.float32)
+        )
+        masked_reference_image = reference_image * mask_image
         # save the reduced images
         fr._save_fits_primary_float32(reference_image, reference_image_path)
         fr._save_fits_primary_float32(mask_image, mask_image_path)
         fr._save_fits_primary_float32(masked_reference_image, masked_reference_image_path)
         if save_plot:
-            fl.plot_reference_and_mask(masked_reference_image, mask_image.shaped, plot_path=redu_dir)
+            fl.plot_reference_and_mask(masked_reference_image, mask_image, plot_path=redu_dir)
 
     return masked_reference_image, mask_image
 
@@ -196,7 +223,7 @@ def s2_image_center(run_params, file_table_static, file_table_output, masked_ref
     
     log.info("=> FINDING IMAGE CENTERS")
     grid = cs.make_camsci_grid(masked_reference_image)
-    mask = Field(mask_image.ravel(), grid)
+    mask = Field(np.asarray(mask_image, dtype=float).ravel(), grid)
     
     # centering function
     # TODO: should be able to start halfway if interrupted
@@ -240,6 +267,100 @@ def s3_save_centered_images(run_params, file_table_static, file_table_output):
     save_centered_images_parallel(jobs, n_workers=n_workers)
     log.info("=> SAVED %s centered frames", len(jobs))
 
+
+def s2b_recenter(
+    run_params, file_table_static, file_table_output, masked_reference_image, mask_image
+):
+    """
+    Second registration pass on frames already in ``centered/``.
+
+    Estimates residual shifts, writes ``recenter_shift_x`` / ``recenter_shift_y``,
+    and overwrites the centered FITS files with the additional correction applied.
+    """
+    if not run_params.get("recenter", False):
+        return file_table_output
+
+    log.info("2b. Second-pass centering on centered frames")
+    redu_dir = run_params["redu_dir"]
+    force_rerun = run_params["force_rerun"]
+    output_path = os.path.join(redu_dir, FILE_TABLE_OUTPUT_NAME)
+    file_table_output = fr.prune_process_output_table(file_table_output)
+
+    jobs = _centered_frame_jobs(file_table_static, file_table_output, run_params)
+    if not jobs:
+        log.warning("2b. No first-pass centered frames available for recentering")
+        return file_table_output
+    if not _centered_frames_complete(jobs):
+        log.warning("2b. Centered FITS files missing; complete step 3 before recentering")
+        return file_table_output
+
+    if not force_rerun and _recenter_complete(file_table_output):
+        log.info("=> RECENTERING ALREADY DONE, SKIPPING")
+        return file_table_output
+
+    log.info("=> FINDING RESIDUAL IMAGE CENTERS")
+    grid = cs.make_camsci_grid(masked_reference_image)
+    mask = Field(np.asarray(mask_image, dtype=float).ravel(), grid)
+    recenter_params = dict(run_params)
+    recenter_params["center_from_centered"] = True
+
+    file_table_output = center_pool(
+        file_table_static,
+        file_table_output,
+        masked_reference_image,
+        mask,
+        grid,
+        recenter_params,
+        max_files=-1,
+        chunk_size=run_params.get("chunk_size", 100),
+        shift_cols=("recenter_shift_y", "recenter_shift_x"),
+    )
+
+    recenter_jobs = _recenter_apply_jobs(file_table_static, file_table_output, run_params)
+    if recenter_jobs:
+        log.info("2b. Applying residual shifts to %s centered frames", len(recenter_jobs))
+        save_centered_images_parallel(recenter_jobs, n_workers=run_params.get("n_workers"))
+
+    fr.write_redu_table(fr.prune_process_output_table(file_table_output), output_path)
+    return file_table_output
+
+
+def s3b_save_first_centered_cube(run_params, file_table_static, file_table_output):
+    """
+    Optional: write a FITS cube of the first N centered frames.
+
+    Controlled by config key ``save_centered_cube_first_n``. When set to a
+    positive integer, this loads the first N rows (in table order) that have
+    finite shifts and an existing centered FITS file under ``centered/``, and
+    writes a stacked cube to ``{redu_dir}/centered_firstN_cube.fits``.
+
+    This is primarily for quick-look / debugging and is independent of step-4
+    filtering (``used_in_reduction`` is not yet computed at this point).
+    """
+    n_first = run_params.get("save_centered_cube_first_n")
+    if n_first is None:
+        return
+    n_first = int(n_first)
+    if n_first <= 0:
+        return
+
+    redu_dir = run_params["redu_dir"]
+    force_rerun = run_params["force_rerun"]
+    out_path = os.path.join(redu_dir, f"centered_first{n_first}_cube.fits")
+    if not force_rerun and os.path.isfile(out_path):
+        log.info("3b. Centered cube exists, skipping (%s)", out_path)
+        return
+
+    row_idxs = _process_filter_row_idxs(file_table_static, file_table_output, run_params)
+    if len(row_idxs) == 0:
+        log.warning("3b. No centered frames available to cube")
+        return
+
+    use = row_idxs[: min(n_first, len(row_idxs))]
+    log.info("3b. Saving first %s centered frames as cube: %s", len(use), out_path)
+    cube = _load_centered_chunk(file_table_static, use, run_params)
+    fits.PrimaryHDU(data=np.asarray(cube, dtype=np.float32)).writeto(out_path, overwrite=True)
+
 # STEP 4 - filtering the new files - save plots, update the table
 def s4_save_statistics(run_params, file_table_static, file_table_output, mask_image):
     """
@@ -249,7 +370,7 @@ def s4_save_statistics(run_params, file_table_static, file_table_output, mask_im
     log.info("4. Applying process filters")
     # needed configuration parameters
     redu_dir = run_params["redu_dir"]
-    force_rerun = run_params["force_rerun"]
+    force_rerun = run_params["rerun_filtering"]
     sigma_mp = run_params.get("max_point_sigma_clip", 2.0)
     sigma_shift = run_params.get("shift_sigma_clip", 2.0)
     sigma_int = run_params.get("speckle_intensity_sigma_clip", 2.0)
@@ -259,9 +380,7 @@ def s4_save_statistics(run_params, file_table_static, file_table_output, mask_im
 
     file_table_output = fr.prune_process_output_table(file_table_output)
 
-    if not force_rerun and _process_filters_complete(
-        file_table_static, file_table_output, run_params
-    ):
+    if not force_rerun:
         log.info("=> PROCESS FILTERS ALREADY APPLIED, SKIPPING")
         return file_table_output
 
@@ -275,21 +394,25 @@ def s4_save_statistics(run_params, file_table_static, file_table_output, mask_im
     speckle_mask = _mask_as_2d(mask_image)
     n = len(row_idxs)
 
+    log.info("=> COLLECTING PEAK IDXS")
     peak_idxs = _collect_peak_idxs_chunked(
         file_table_static, row_idxs, run_params, chunk_size
     )
     pass_mp, radius = fl.filter_max_point_from_peak_idxs(peak_idxs, sigma_clip=sigma_mp)
     file_table_output["max_point_radius"][row_idxs] = radius
 
+    log.info("=> COLLECTING SHIFTS")
     shifts = _shifts_for_row_idxs(file_table_output, row_idxs)
     pass_cs = fl.filter_center_shifts(shifts, sigma_clip=sigma_shift)
 
+    log.info("=> COLLECTING SPECKLE INTENSITIES")
     intensities = _collect_speckle_intensities_chunked(
         file_table_static, row_idxs, run_params, speckle_mask, chunk_size
     )
     pass_si, _ = fl.filter_speckle_intensity_values(intensities, sigma_clip=sigma_int)
     file_table_output["speckle_intensity"][row_idxs] = intensities
 
+    log.info("=> FILTERING RMS")
     pass_rms, rms_dev = _filter_rms_chunked(
         file_table_static,
         row_idxs,
@@ -301,6 +424,7 @@ def s4_save_statistics(run_params, file_table_static, file_table_output, mask_im
     file_table_output["rms_deviation"][row_idxs] = rms_dev
 
     # check against all the filters for which to keep
+    log.info("=> CHECKING AGAINST ALL FILTERS")
     used = pass_mp & pass_cs & pass_si & pass_rms
     file_table_output["used_in_reduction"][row_idxs] = used.astype(int)
 
@@ -356,6 +480,54 @@ def s4_save_statistics(run_params, file_table_static, file_table_output, mask_im
     fr.write_redu_table(fr.prune_process_output_table(file_table_output), output_path)
     return file_table_output
 
+
+def s4b_save_filtered_centered_cube(run_params, file_table_static, file_table_output):
+    """
+    Optional: write a FITS cube of the first N *kept* centered frames.
+
+    Controlled by config key ``save_filtered_centered_cube_first_n``. When set to a
+    positive integer, this selects the first N rows (in table order) with
+    ``used_in_reduction == 1`` and an existing centered FITS file under
+    ``{redu_dir}/centered/``. It writes the stacked cube to
+    ``{redu_dir}/centered_kept_firstN_cube.fits``.
+
+    This runs after step 4 so it respects the filter decisions.
+    """
+    n_first = run_params.get("save_filtered_centered_cube_first_n")
+    if n_first is None:
+        return
+    n_first = int(n_first)
+    if n_first <= 0:
+        return
+
+    redu_dir = run_params["redu_dir"]
+    force_rerun = run_params["force_rerun"]
+    out_path = os.path.join(redu_dir, f"centered_kept_first{n_first}_cube.fits")
+    if not force_rerun and os.path.isfile(out_path):
+        log.info("4b. Filtered centered cube exists, skipping (%s)", out_path)
+        return
+
+    # Use the same criteria as step 4 for centered-file existence, plus the final keep flag.
+    row_idxs = _process_filter_row_idxs(file_table_static, file_table_output, run_params)
+    if len(row_idxs) == 0:
+        log.warning("4b. No centered frames available to cube")
+        return
+
+    used = np.asarray(file_table_output["used_in_reduction"][row_idxs], dtype=int) == 1
+    kept_rows = row_idxs[used]
+    if len(kept_rows) == 0:
+        log.warning("4b. No kept frames (used_in_reduction=1); not writing cube")
+        return
+
+    use = kept_rows[: min(n_first, len(kept_rows))]
+    log.info(
+        "4b. Saving first %s kept centered frames as cube: %s",
+        len(use),
+        out_path,
+    )
+    cube = _load_centered_chunk(file_table_static, use, run_params)
+    fits.PrimaryHDU(data=np.asarray(cube, dtype=np.float32)).writeto(out_path, overwrite=True)
+
     
 ########################################################
 ################### Helper functions ###################
@@ -389,7 +561,17 @@ def create_reference_image(unsats_dir, unsats_nospark_dir):
 
 ################### STEP 2 ###################
 
-def center_pool(file_table, file_table_output, ref_image, mask, grid, params, max_files=-1, chunk_size=100):
+def center_pool(
+    file_table,
+    file_table_output,
+    ref_image,
+    mask,
+    grid,
+    params,
+    max_files=-1,
+    chunk_size=100,
+    shift_cols=("shift_y", "shift_x"),
+):
     """
     Find registration shifts in stacks of ``center_coadd_n`` frames (mean coadd
     before FFT registration when ``center_coadd_n`` > 1).
@@ -405,9 +587,11 @@ def center_pool(file_table, file_table_output, ref_image, mask, grid, params, ma
     used_idxs = used_idxs[:max_files]
 
     coadd_n = max(1, int(params.get("center_coadd_n", 1)))
+    pass_label = "2b" if shift_cols != ("shift_y", "shift_x") else "2"
     stacks = _stack_row_indices(used_idxs, coadd_n)
     log.info(
-        "2. Centering %s frames in %s stacks (center_coadd_n=%s)",
+        "%s. Centering %s frames in %s stacks (center_coadd_n=%s)",
+        pass_label,
         len(used_idxs),
         len(stacks),
         coadd_n,
@@ -428,7 +612,11 @@ def center_pool(file_table, file_table_output, ref_image, mask, grid, params, ma
         for stack_id, stack_rows in batch:
             shifts = center_stack(file_table, stack_rows, ref_image, mask, grid, params)
             file_table_output = fr.update_file_table_output(
-                file_table_output, stack_rows, shifts, center_stack_id=stack_id
+                file_table_output,
+                stack_rows,
+                shifts,
+                center_stack_id=stack_id,
+                shift_cols=shift_cols,
             )
     return file_table_output
 
@@ -445,7 +633,10 @@ def _stack_row_indices(used_idxs, coadd_n):
 
 def center_stack(file_table, idxs, ref_image, mask, grid, params):
     """Load frames for one stack, optionally coadd, and estimate registration shifts."""
-    data_cube = data_cube_fom_idxs(file_table, idxs, params)
+    if params.get("center_from_centered", False):
+        data_cube = _load_centered_chunk(file_table, idxs, params)
+    else:
+        data_cube = data_cube_fom_idxs(file_table, idxs, params)
     coadd_n = max(1, int(params.get("center_coadd_n", 1)))
     if coadd_n > 1 and len(idxs) > 1:
         coadded = np.mean(data_cube, axis=0, keepdims=True)
@@ -469,6 +660,18 @@ def _centering_complete(file_table_output):
         csi = np.asarray(file_table_output["center_stack_id"], dtype=int)[maj]
         return bool(np.all(csi >= 0))
     return True
+
+
+def _recenter_complete(file_table_output):
+    """True when every majority-config row has finite second-pass shifts."""
+    if "recenter_shift_y" not in file_table_output.colnames:
+        return False
+    maj = np.asarray(file_table_output["pass_majority_config"], dtype=int) == 1
+    if not np.any(maj):
+        return False
+    sy = np.asarray(file_table_output["recenter_shift_y"], dtype=float)[maj]
+    sx = np.asarray(file_table_output["recenter_shift_x"], dtype=float)[maj]
+    return bool(np.all(np.isfinite(sy) & np.isfinite(sx)))
 
 
 def data_cube_fom_idxs(file_table_static, idxs, params):
@@ -567,6 +770,24 @@ def _centered_frame_jobs(file_table_static, file_table_output, run_params):
     return jobs
 
 
+def _recenter_apply_jobs(file_table_static, file_table_output, run_params):
+    """Build in-place shift jobs for second-pass correction on centered FITS files."""
+    redu_dir = run_params["redu_dir"]
+    out_dir = os.path.join(redu_dir, CENTERED_FRAMES_DIR)
+    jobs = []
+    n = len(file_table_output)
+    for i in range(n):
+        if int(file_table_output["pass_majority_config"][i]) != 1:
+            continue
+        sy = float(file_table_output["recenter_shift_y"][i])
+        sx = float(file_table_output["recenter_shift_x"][i])
+        if not np.isfinite(sy) or not np.isfinite(sx):
+            continue
+        path = os.path.join(out_dir, str(file_table_static["filename"][i]))
+        jobs.append((path, path, sy, sx, None))
+    return jobs
+
+
 def _centered_frames_complete(jobs):
     """True when every centered output file in ``jobs`` already exists."""
     return bool(jobs) and all(os.path.isfile(dst) for _, dst, _, _, _ in jobs)
@@ -577,7 +798,13 @@ def _centered_frames_complete(jobs):
 def _mask_as_2d(mask_image):
     if hasattr(mask_image, "shaped"):
         return np.asarray(mask_image.shaped, dtype=float)
-    return np.asarray(mask_image, dtype=float)
+    arr = np.asarray(mask_image, dtype=float)
+    if arr.ndim == 1:
+        n = arr.size
+        side = int(np.sqrt(n))
+        if side * side == n:
+            return arr.reshape((side, side))
+    return arr
 
 
 def _chunk_slices(n, chunk_size):
@@ -587,12 +814,14 @@ def _chunk_slices(n, chunk_size):
 
 
 def _shifts_for_row_idxs(file_table_output, row_idxs):
-    return np.column_stack(
-        [
-            np.asarray(file_table_output["shift_y"][row_idxs], dtype=float),
-            np.asarray(file_table_output["shift_x"][row_idxs], dtype=float),
-        ]
-    )
+    sy = np.asarray(file_table_output["shift_y"][row_idxs], dtype=float)
+    sx = np.asarray(file_table_output["shift_x"][row_idxs], dtype=float)
+    if "recenter_shift_y" in file_table_output.colnames:
+        ry = np.asarray(file_table_output["recenter_shift_y"][row_idxs], dtype=float)
+        rx = np.asarray(file_table_output["recenter_shift_x"][row_idxs], dtype=float)
+        sy = sy + np.where(np.isfinite(ry), ry, 0.0)
+        sx = sx + np.where(np.isfinite(rx), rx, 0.0)
+    return np.column_stack([sy, sx])
 
 
 def _collect_peak_idxs_chunked(file_table_static, row_idxs, run_params, chunk_size):
@@ -869,9 +1098,17 @@ def build_process_run_params(
     p.setdefault("plot_speckle_intensity", p["plot"])
     p.setdefault("plot_rms", p["plot"])
     p.setdefault("force_rerun", False)
+    p.setdefault("rerun_filtering", False)
     p.setdefault("n_workers", os.cpu_count() or 1)
     p.setdefault("chunk_size", 100)
     p.setdefault("center_coadd_n", 1)
+    p.setdefault("recenter", False)
+    # Optional quick-look product: save first N centered frames as a cube in step 3b.
+    # Set to an int > 0 to enable.
+    p.setdefault("save_centered_cube_first_n", None)
+    # Optional quick-look product: save first N *kept* centered frames (after step 4 filtering).
+    # Set to an int > 0 to enable.
+    p.setdefault("save_filtered_centered_cube_first_n", None)
     p.setdefault("masterdark_dir", p["redu_path"])
     p.setdefault("max_point_sigma_clip", 2.0)
     p.setdefault("shift_sigma_clip", 2.0)

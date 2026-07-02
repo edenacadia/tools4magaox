@@ -5,23 +5,30 @@ obs_path = "/Volumes/magaox_bpic/2025B/"
 redu_path = "/Volumes/magaox_bpic/redu/"
 masterdark_dir = "/Volumes/magaox_bpic/redu/"
 
-data_dir = "2025-12-02_070348_beta_pic_coron_lg"
+data_dir = "2025-12-02_062543_beta_pic_coron_lg"
 unsats_dir = "2025-12-02_065035_beta_pic_coron_lg_unsats"
 unsats_nospark_dir = "2025-12-02_065549_beta_pic_coron_lg_unsats_nospark"
 
-cameras = ["camsci1", "camsci2"]
+cameras = ["camsci1"]
 
 # sparkle mask (step 1); order matches ``cameras`` when a list
 spark_ang = 0
 spark_sep = 20
-wavelength = [908e-9, 615e-9]
+wavelength = [908e-9] #  615e-9
 
 # optional params
 plot = True
-force_rerun = True
+force_rerun = False
 max_files = -1
 chunk_size = 100
 center_coadd_n = 1
+recenter = True
+
+# Optional: save a quick-look FITS cube of the first N centered frames (step 3b)
+# save_centered_cube_first_n = 500
+
+# Optional: save a quick-look FITS cube of the first N *kept* centered frames (step 4b)
+save_filtered_centered_cube_first_n = 500
 
 # per-step / per-filter plots (default to ``plot`` when omitted)
 plot_reference = True
@@ -31,8 +38,9 @@ plot_speckle_intensity = True
 plot_rms = True
 
 # step 4 process filters (sigma clip cutoffs)
+rerun_filtering = True
 max_point_sigma_clip = 2
-shift_sigma_clip = 2
-speckle_intensity_sigma_clip = 2
+shift_sigma_clip = 1.5
+speckle_intensity_sigma_clip = 1.5
 rms_sigma_clip = 2
 rms_iterations = 3
