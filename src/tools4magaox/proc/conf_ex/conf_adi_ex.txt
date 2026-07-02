@@ -13,18 +13,33 @@ psf_crop_size = 30
 psf_norm_size = 19
 
 # Step 2 — ADI cube assembly
-# Crop is specified as radius from center
-crop_r = 120
-coadd_mode = "none"
+# Outer: square crop (2*R x 2*R) then zero corners outside circle of radius R
+crop_radius_outer = 120
+# Inner: zero pixels within this radius of center
+crop_radius_inner = 30
+# quick run: sparse frame subsample (disable for production ADI)
+fast_test = False
+fast_test_stride = 20
+coadd_mode = "none" # "frames" "time"
 frame_coadd_n = 10
-time_coadd_sec = 10.0
+time_coadd_sec = 1.0
+
+# Parallactic angles — pass header PARANG in degrees; VIP derotates by -angle internally
+# parang_units = "deg"   # "deg" | "rad" | "auto"
+parang_offset_deg = 90.0
+parang_sign = 1.0       # keep 1.0 unless debugging rotation direction
+
+# sanity check: median VIP derotation should peak near this separation (px)
+expected_source_r_px = 87
 
 # Step 3 — VIP PCA-ADI (tutorial 3.5.1)
-ncomp = 5
+ncomp = 15
 imlib = "vip-fft"
 interpolation = None
 svd_mode = "arpack"
 nproc = None
+# radius of the center circular mask
+mask_center_px = 30
 # incremental PCA: None = single pass; int = frames per mini-batch; float in (0,1] = memory fraction
 batch = 0.5
 

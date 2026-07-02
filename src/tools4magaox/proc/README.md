@@ -61,12 +61,19 @@ Step 1 (PSF):
 
 Step 2 (cube):
 
-- `crop_r` — optional crop radius in pixels from the frame center; final crop shape is `(2*crop_r, 2*crop_r)` (square). Omit or set `None` to skip
-- `crop_shape` — legacy optional `(height, width)` center crop on the ADI cube. Alias: `crop_size`. Only used when `crop_r` is not set
+- `crop_radius_outer` — crop to square `(2*R, 2*R)` then zero pixels outside the circle of radius `R` (square corners masked). Legacy alias: `crop_r`
+- `crop_radius_inner` — zero pixels inside the central disk of radius `R`. Legacy alias: `cube_mask_center_px`
+- `fast_test` — if `True`, only every `fast_test_stride` **approved** frame is used (quick-look only; leave `False` for production ADI)
+- `fast_test_stride` — stride for `fast_test` (default `100`)
 - `coadd_mode` — `"none"`, `"frames"`, or `"time"`
 - `frame_coadd_n` — consecutive frames per coadd when `coadd_mode = "frames"`
 - `time_coadd_sec` — minimum time span per coadd group (seconds) when `coadd_mode = "time"`
 - `chunk_size` — batch size when loading centered FITS files (default `100`)
+- `parang_units` — `"deg"` (default), `"rad"`, or `"auto"` (heuristic)
+- `parang_sign` — `1.0` (default). Pass header `PARANG` as-is: VIP `cube_derotate` already rotates each frame by `-angle`. Only flip to `-1.0` when debugging rotation direction
+- `parang_offset_deg` — additional offset applied to angles (degrees), default `0.0`
+- `expected_source_r_px` — optional companion separation (px) for `adi_rotation_probe.txt` (median VIP derotation sanity check)
+- `rotation_probe_max_frames` — max frames subsampled for the rotation probe (default `500`)
 
 Step 3 (PCA):
 
@@ -110,7 +117,13 @@ Written to `{redu_path}{data_dir}/{camera}/adi/` (override folder name with `adi
 | `psf_normalized.fits` | VIP flux-normalized PSF |
 | `psf_fwhm.txt` | FWHM from `normalize_psf` |
 | `adi_cube.fits` | ADI datacube `(N, H, W)` |
+| `adi_aperture_mask.fits` | combined outer/inner keep-mask (1 = valid pixels) |
+| `adi_outer_mask.fits` | outer circular mask when `crop_radius_outer` is set |
+| `adi_inner_mask.fits` | inner mask when `crop_radius_inner` is set |
 | `adi_parang.fits` | parallactic angles, one per cube frame |
+| `adi_parang_summary.txt` | PARANG range and VIP derotation note |
+| `adi_frame_selection.txt` | frame counts at each selection gate |
+| `adi_rotation_probe.txt` | median-derotation peak radius vs `expected_source_r_px` |
 | `adi_pca.fits` | derotated PCA-ADI combined frame |
 | `adi_snrmap.fits` | SNR map |
 | `adi_psf_normalized.png` | normalized PSF plot |
@@ -129,3 +142,60 @@ Written to `{redu_path}{data_dir}/{camera}/adi/` (override folder name with `adi
 
 - [`utils.py`](utils.py) — frame selection, centered-cube loading, center crop, matplotlib plots
 - Example config: [`conf_ex/conf_adi_ex.txt`](conf_ex/conf_adi_ex.txt)
+
+## Metrics
+
+[`metrics.py`](metrics.py) runs VIP throughput, contrast curve, and SNR source-peak metrics on centered/ADI data. It prefers existing ADI products under `adi/` and rebuilds them from `centered/` via ADI step functions when missing.
+
+Run after `process.py` (and ideally `ADI.py`) on the same `data_dir` and `cameras`.
+
+```
+python metrics.py conf_ex/conf_metrics_ex.txt --throughput --contrast --source-peak
+```
+
+From the repo root:
+
+```
+PYTHONPATH=src python src/tools4magaox/proc/metrics.py \
+  src/tools4magaox/proc/conf_ex/conf_metrics_ex.txt \
+  --throughput --contrast --source-peak
+```
+
+CLI flags (`--throughput`, `--contrast`, `--source-peak`) select which metrics to run. When no flags are given, the config keys `run_throughput`, `run_contrast`, and `run_source_peak` control selection.
+
+### Prerequisites
+
+- `process.py` completed for the target `data_dir` / `camera`
+- ADI products recommended (`adi/adi_cube.fits`, `adi_pca.fits`, `adi_snrmap.fits`, etc.); metrics will call ADI steps to create missing products
+
+### conf variables
+
+Inherits ADI/reduction keys (`redu_path`, `data_dir`, `cameras`, frame selection, crop radii, PCA params) plus:
+
+- `run_throughput`, `run_contrast`, `run_source_peak` — default on/off when no CLI flags
+- `metrics_output_dir` — output subdirectory (default `"metrics"`)
+- `pxscale` — arcsec/px (required for contrast curve)
+- `starphot` — star flux in coronagraphic frames; `None` auto-derives from PSF flux and EXPTIME ratio
+- `starphot_psf_exptime` — reference PSF exposure time for starphot scaling (optional)
+- `contrast_sigma`, `throughput_nbranch`, `contrast_nbranch` — VIP sampling controls
+- `metrics_inner_rad`, `fc_rad_sep`, `noise_sep`, `wedge` — fake-companion injection geometry
+- `expected_source_r_px`, `source_peak_inner_exclude_px`, `source_peak_annulus_half_width` — SNR peak search
+- `plot_throughput`, `plot_contrast`, `plot_source_peak` — diagnostic PNGs
+- `force_rerun` — recompute even when outputs exist
+
+Example config: [`conf_ex/conf_metrics_ex.txt`](conf_ex/conf_metrics_ex.txt)
+
+### pipeline outputs
+
+Written to `{redu_path}{data_dir}/{camera}/metrics/`:
+
+| File | Description |
+|---|---|
+| `metrics_config.txt` | copy of the config used for this run |
+| `metrics.log` | run log |
+| `metrics_throughput.csv` | throughput vs separation |
+| `metrics_throughput.png` | throughput plot (optional) |
+| `metrics_contrast.csv` | contrast curve table |
+| `metrics_contrast.png` | contrast plot (optional) |
+| `metrics_source_peak.txt` | peak `(y, x)`, SNR, and radius |
+| `metrics_source_peak.png` | SNR map with peak marked (optional) |

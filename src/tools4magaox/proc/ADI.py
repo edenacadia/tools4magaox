@@ -11,7 +11,6 @@ from vip_hci.fm import normalize_psf
 from vip_hci.psfsub import pca, pca_annular, pca_grid
 from vip_hci.metrics import snrmap
 
-from tools4magaox.redu import centering as ct
 from tools4magaox.redu import filereads as fr
 from tools4magaox.proc import utils as pu
 
@@ -35,6 +34,9 @@ PSF_30X30_NAME = "psf_30x30.fits"
 PSF_NORMALIZED_NAME = "psf_normalized.fits"
 ADI_CUBE_NAME = "adi_cube.fits"
 ADI_PARANG_NAME = "adi_parang.fits"
+ADI_APERTURE_MASK_NAME = "adi_aperture_mask.fits"
+ADI_OUTER_MASK_NAME = "adi_outer_mask.fits"
+ADI_INNER_MASK_NAME = "adi_inner_mask.fits"
 ADI_PCA_NAME = "adi_pca.fits"
 ADI_SNRMAP_NAME = "adi_snrmap.fits"
 ADI_PCA_ANNULUS_NAME = "adi_pca_annulus.fits"
@@ -44,6 +46,8 @@ ADI_PCA_GRID_FULLFR_NPC_NAME = "adi_pca_grid_fullfr_opt_npc.txt"
 ADI_PCA_GRID_ANNULAR_NPC_NAME = "adi_pca_grid_annular_opt_npc.txt"
 ADI_PCA_GRID_FULLFR_CSV_NAME = "adi_pca_grid_fullfr.csv"
 ADI_PCA_GRID_ANNULAR_CSV_NAME = "adi_pca_grid_annular.csv"
+ADI_FRAME_SELECTION_NAME = "adi_frame_selection.txt"
+ADI_ROTATION_PROBE_NAME = "adi_rotation_probe.txt"
 
 PLOT_PSF_NAME = "adi_psf_normalized.png"
 PLOT_PARANG_NAME = "adi_parang_timeseries.png"
@@ -155,7 +159,7 @@ def s1_build_psf(run_params):
     result = normalize_psf(
         psf_crop,
         size=psf_norm_size,
-        debug=plot_psf,
+        debug=False,
         full_output=True,
     )
     psfn, flux, fwhm = result
@@ -188,21 +192,48 @@ def s2_build_adi_cube(run_params, file_table_static, file_table_output):
     cube_path = os.path.join(adi_dir, ADI_CUBE_NAME)
     parang_path = os.path.join(adi_dir, ADI_PARANG_NAME)
 
+    row_idxs = pu.select_adi_frame_rows(file_table_static, file_table_output, run_params)
+    selection = pu.summarize_adi_frame_selection(
+        file_table_static, file_table_output, run_params
+    )
+    _write_adi_frame_selection_summary(adi_dir, selection, row_idxs, run_params)
+
     if not force_rerun and os.path.isfile(cube_path) and os.path.isfile(parang_path):
         log.info("=> LOADING ADI CUBE")
         cube = fr._load_fits_primary_float32(cube_path)
         parang = fr._load_fits_primary_float32(parang_path)
         times = None
+        _run_adi_rotation_probe(adi_dir, cube, parang, run_params)
         return cube, parang, times
 
-    row_idxs = pu.select_adi_frame_rows(
-        file_table_static, file_table_output, run_params
-    )
+    if selection["selected_for_adi"] == 0:
+        raise ValueError(
+            "No frames available for ADI cube (check centered/ and used_in_reduction)"
+        )
     if len(row_idxs) == 0:
         raise ValueError(
             "No frames available for ADI cube (check centered/ and used_in_reduction)"
         )
-    log.info("=> Loading %s centered frames", len(row_idxs))
+
+    n_before_subsample = len(row_idxs)
+    if bool(run_params.get("fast_test", False)):
+        stride = int(run_params.get("fast_test_stride", 100))
+        if stride <= 0:
+            raise ValueError(f"fast_test_stride must be positive, got {stride}")
+        row_idxs = row_idxs[::stride]
+        log.warning(
+            "=> fast_test enabled: using %s/%s approved frames (every %sth frame). "
+            "Disable fast_test for production ADI.",
+            len(row_idxs),
+            n_before_subsample,
+            stride,
+        )
+    else:
+        log.info(
+            "=> Loading %s approved frames (used_in_reduction=%s)",
+            len(row_idxs),
+            bool(run_params.get("require_used_in_reduction", True)),
+        )
 
     cube = pu.load_centered_cube_chunked(
         file_table_static,
@@ -212,21 +243,63 @@ def s2_build_adi_cube(run_params, file_table_static, file_table_output):
     )
     parang, times = pu.parang_and_times_for_rows(file_table_static, row_idxs)
 
-    # Cropping: prefer crop_r (radius from center) => final shape (2*crop_r, 2*crop_r).
-    # Backward compatible: accept crop_shape / crop_size if provided.
-    crop_r = run_params.get("crop_r")
-    if crop_r is not None:
-        crop_r = int(crop_r)
-        if crop_r <= 0:
-            raise ValueError(f"crop_r must be positive, got {crop_r}")
-        crop_shape = (2 * crop_r, 2 * crop_r)
-        log.info("=> Cropping cube to crop_r=%s (shape=%s)", crop_r, crop_shape)
-        cube = ct.crop_cube(cube, new_shape=crop_shape)
-    else:
-        crop_shape = run_params.get("crop_shape")
-        if crop_shape is not None:
-            log.info("=> Cropping cube to %s", crop_shape)
-            cube = ct.crop_cube(cube, new_shape=tuple(crop_shape))
+    # Parallactic angles handling: unit conversion + sign/offset.
+    parang = np.asarray(parang, dtype=float)
+    parang_units = str(run_params.get("parang_units", "deg")).lower()
+    if parang_units == "auto":
+        # Heuristic: radians are typically within [-2π, 2π] while degrees span tens/hundreds.
+        parang_units = "rad" if np.nanmax(np.abs(parang)) <= 7.0 else "deg"
+        log.info("=> parang_units auto-detected as %s", parang_units)
+    if parang_units == "rad":
+        parang = np.rad2deg(parang)
+    elif parang_units != "deg":
+        raise ValueError(f"parang_units must be 'deg', 'rad', or 'auto', got {parang_units!r}")
+
+    parang_sign = float(run_params.get("parang_sign", 1.0))
+    parang_offset_deg = float(run_params.get("parang_offset_deg", 0.0))
+    parang = parang_sign * (parang + parang_offset_deg)
+
+    # Write a quick diagnostic summary to help catch unit/sign mistakes.
+    summary_path = os.path.join(adi_dir, "adi_parang_summary.txt")
+    finite = np.isfinite(parang)
+    if np.any(finite):
+        pmin = float(np.min(parang[finite]))
+        pmax = float(np.max(parang[finite]))
+        pspan = float(pmax - pmin)
+        with open(summary_path, "w", encoding="utf-8") as fh:
+            fh.write(f"parang_units={parang_units}\n")
+            fh.write(f"parang_sign={parang_sign}\n")
+            fh.write(f"parang_offset_deg={parang_offset_deg}\n")
+            fh.write(
+                "vip_derotation_note=VIP cube_derotate applies -angle internally; "
+                "use parang_sign=1.0 with header PARANG unless debugging\n"
+            )
+            fh.write(f"min_deg={pmin}\nmax_deg={pmax}\nspan_deg={pspan}\n")
+
+    radius_outer = run_params.get("crop_radius_outer")
+    radius_inner = run_params.get("crop_radius_inner")
+    if radius_outer is not None or radius_inner is not None:
+        log.info(
+            "=> Applying crop radii outer=%s inner=%s",
+            radius_outer,
+            radius_inner,
+        )
+        cube, aperture_mask, outer_mask, inner_mask = pu.apply_crop_radius_masks(
+            cube,
+            radius_outer=radius_outer,
+            radius_inner=radius_inner,
+        )
+        fr._save_fits_primary_float32(
+            aperture_mask, os.path.join(adi_dir, ADI_APERTURE_MASK_NAME)
+        )
+        if outer_mask is not None:
+            fr._save_fits_primary_float32(
+                outer_mask, os.path.join(adi_dir, ADI_OUTER_MASK_NAME)
+            )
+        if inner_mask is not None:
+            fr._save_fits_primary_float32(
+                inner_mask, os.path.join(adi_dir, ADI_INNER_MASK_NAME)
+            )
 
     coadd_mode = str(run_params.get("coadd_mode", "none")).lower()
     if coadd_mode == "frames":
@@ -249,6 +322,8 @@ def s2_build_adi_cube(run_params, file_table_static, file_table_output):
     log.info("ADI cube shape: %s, %s parang values", cube.shape, len(parang))
     fr._save_fits_primary_float32(cube, cube_path)
     fr._save_fits_primary_float32(np.asarray(parang, dtype=np.float32), parang_path)
+
+    _run_adi_rotation_probe(adi_dir, cube, parang, run_params)
 
     if _adi_plot_enabled(run_params, "plot_parang") and times is not None:
         pu.save_parang_timeseries_plot(
@@ -282,7 +357,7 @@ def s3_run_pca(run_params, cube, angs):
 
     kwargs = dict(
         ncomp=run_params["ncomp"],
-        mask_center_px=None,
+        mask_center_px=run_params.get("mask_center_px", None),
         imlib=run_params.get("imlib", "vip-fft"),
         interpolation=run_params.get("interpolation"),
         svd_mode=run_params.get("svd_mode", "arpack"),
@@ -468,6 +543,66 @@ def s5_pca_annulus_grid(run_params, cube, angs, fwhm):
             )
 
 
+def _run_adi_rotation_probe(adi_dir, cube, parang, run_params):
+    probe = pu.adi_rotation_alignment_probe(
+        cube,
+        parang,
+        expected_r_px=run_params.get("expected_source_r_px"),
+        inner_exclude_px=run_params.get("crop_radius_inner")
+        or run_params.get("mask_center_px")
+        or 30.0,
+        max_frames=int(run_params.get("rotation_probe_max_frames", 500)),
+    )
+    _write_adi_rotation_probe(adi_dir, probe, run_params)
+
+
+def _write_adi_frame_selection_summary(adi_dir, selection, row_idxs, run_params):
+    """Log and save how many frames pass each ADI selection gate."""
+    lines = [f"{key}={value}" for key, value in selection.items()]
+    lines.append(f"cube_frames={len(row_idxs)}")
+    if bool(run_params.get("fast_test", False)):
+        lines.append(f"fast_test=True")
+        lines.append(f"fast_test_stride={run_params.get('fast_test_stride')}")
+    pu.save_adi_diagnostics(os.path.join(adi_dir, ADI_FRAME_SELECTION_NAME), lines)
+    log.info(
+        "ADI frame selection: %s/%s roster rows selected "
+        "(majority=%s, centered=%s, used_in_reduction=%s)",
+        selection["selected_for_adi"],
+        selection["roster_rows"],
+        selection["pass_majority_config"],
+        selection["centered_file_exists"],
+        selection["used_in_reduction"],
+    )
+
+
+def _write_adi_rotation_probe(adi_dir, probe, run_params):
+    """Log median-derotation peak radius vs expected companion separation."""
+    if probe is None:
+        return
+    lines = [f"{key}={value}" for key, value in probe.items()]
+    pu.save_adi_diagnostics(os.path.join(adi_dir, ADI_ROTATION_PROBE_NAME), lines)
+    expected = probe["expected_r_px"]
+    peak_r = probe["peak_r_px"]
+    log.info(
+        "Rotation probe (median VIP derotate): peak at (y,x)=(%s,%s) r=%.1f px "
+        "(expected %.1f px); peak=%.3g inner_ring=%.3g",
+        probe["peak_y"],
+        probe["peak_x"],
+        peak_r,
+        expected,
+        probe["peak_value"],
+        probe["inner_peak_value"],
+    )
+    if abs(peak_r - expected) > 5.0:
+        log.warning(
+            "Rotation probe peak radius %.1f px differs from expected_source_r_px "
+            "%.1f px — check parang_sign (default 1.0; VIP negates angles internally) "
+            "and disable fast_test for production runs",
+            peak_r,
+            expected,
+        )
+
+
 def _pca_rot_kwargs(run_params):
     """Rotation / multiprocessing kwargs shared by VIP PCA routines."""
     kwargs = {
@@ -572,6 +707,46 @@ def run_adi_from_config(params, config_source_path=None):
             log.exception("Error in ADI for %s %s", data_dir, camera)
 
 
+def _resolve_crop_radius_params(params):
+    """
+    Normalize crop radius config keys.
+
+    Primary keys: ``crop_radius_outer``, ``crop_radius_inner``.
+    Legacy aliases: ``crop_r``, ``cube_mask_center_px``.
+    """
+    outer = params.get("crop_radius_outer")
+    if outer is None and params.get("crop_r") is not None:
+        outer = params["crop_r"]
+    inner = params.get("crop_radius_inner")
+    if inner is None and params.get("cube_mask_center_px") is not None:
+        inner = params["cube_mask_center_px"]
+
+    if outer is not None:
+        outer = float(outer)
+        if outer <= 0:
+            raise ValueError(f"crop_radius_outer must be positive, got {outer}")
+        params["crop_radius_outer"] = outer
+    else:
+        params["crop_radius_outer"] = None
+
+    if inner is not None:
+        inner = float(inner)
+        if inner < 0:
+            raise ValueError(f"crop_radius_inner must be non-negative, got {inner}")
+        params["crop_radius_inner"] = inner if inner > 0 else None
+    else:
+        params["crop_radius_inner"] = None
+
+    if (
+        params["crop_radius_outer"] is not None
+        and params["crop_radius_inner"] is not None
+        and params["crop_radius_inner"] >= params["crop_radius_outer"]
+    ):
+        raise ValueError(
+            "crop_radius_inner must be < crop_radius_outer when both are set"
+        )
+
+
 def build_adi_run_params(params, camera, *, config_source_path=None):
     """Shallow copy of config plus per-camera ``redu_dir`` and defaults."""
     p = dict(params)
@@ -608,15 +783,28 @@ def build_adi_run_params(params, camera, *, config_source_path=None):
     p.setdefault("plot_pca_annulus_grid", p["plot"])
     p.setdefault("force_rerun", False)
     p.setdefault("chunk_size", 100)
+    # Quick mode: use a sparse subset of frames for the ADI cube build.
+    p.setdefault("fast_test", False)
+    p.setdefault("fast_test_stride", 100)
+    p.setdefault("crop_radius_outer", None)
+    p.setdefault("crop_radius_inner", None)
+    # Parallactic angle handling.
+    p.setdefault("parang_units", "deg")  # 'deg', 'rad', or 'auto'
+    p.setdefault("parang_sign", 1.0)     # VIP derotates by -angle internally
+    p.setdefault("parang_offset_deg", 0.0)
+    p.setdefault("expected_source_r_px", None)
+    p.setdefault("rotation_probe_max_frames", 500)
     if p.get("fwhm") is not None:
         p["fwhm_override"] = float(p["fwhm"])
     else:
         p["fwhm_override"] = None
-    # Cropping options:
-    # - preferred: crop_r (radius in px from center; final shape = (2*crop_r, 2*crop_r))
-    # - legacy: crop_shape / crop_size (tuple (H, W))
-    if "crop_r" in p and p["crop_r"] is not None:
-        p["crop_r"] = int(p["crop_r"])
+    _resolve_crop_radius_params(p)
+    if p.get("fast_test"):
+        p["fast_test_stride"] = int(p.get("fast_test_stride", 100))
+        if p["fast_test_stride"] <= 0:
+            raise ValueError(
+                f"fast_test_stride must be positive, got {p['fast_test_stride']}"
+            )
     if p.get("batch") is not None:
         batch = p["batch"]
         if isinstance(batch, bool) or not isinstance(batch, (int, float)):
@@ -657,8 +845,6 @@ def build_adi_run_params(params, camera, *, config_source_path=None):
                 f"got {range_pcs!r}"
             )
         p["pca_grid_range_pcs"] = tuple(int(v) for v in range_pcs)
-    if "crop_shape" not in p and p.get("crop_size") is not None:
-        p["crop_shape"] = p["crop_size"]
     if config_source_path is not None:
         p["config_source_path"] = config_source_path
     return p

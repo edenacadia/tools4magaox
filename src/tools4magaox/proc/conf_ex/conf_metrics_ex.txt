@@ -1,0 +1,65 @@
+# Example metrics config — run after process.py (and ideally ADI.py) on the same data_dir / cameras
+# python src/tools4magaox/proc/metrics.py src/tools4magaox/proc/conf_ex/conf_metrics_ex.txt
+
+redu_path = "/Volumes/magaox_bpic/redu/"
+data_dir = "2025-12-02_062543_beta_pic_coron_lg"
+cameras = ["camsci1"]
+
+# Which metrics to run when no CLI flags are given
+run_throughput = True
+run_contrast = True
+run_source_peak = True
+
+# Output subdirectory under {redu_path}{data_dir}/{camera}/
+metrics_output_dir = "metrics"
+
+# frame selection (default: only process-filtered frames)
+require_used_in_reduction = True
+
+# PSF / cube assembly (used when ADI products are missing)
+psf_crop_size = 30
+psf_norm_size = 19
+crop_radius_outer = 120
+crop_radius_inner = 30
+fast_test = False
+fast_test_stride = 20
+coadd_mode = "none"
+frame_coadd_n = 10
+time_coadd_sec = 1.0
+parang_sign = 1.0
+chunk_size = 100
+
+# VIP PCA algo params (passed to throughput / contrast_curve)
+ncomp = 15
+imlib = "vip-fft"
+interpolation = None
+svd_mode = "arpack"
+nproc = None
+mask_center_px = 30
+batch = 0.5
+fwhm = None
+
+# Contrast curve
+pxscale = 0.0133
+starphot = None
+# starphot_psf_exptime = 1.0
+contrast_sigma = 5
+contrast_nbranch = 1
+
+# Throughput
+throughput_nbranch = 1
+metrics_inner_rad = None
+fc_rad_sep = 3
+noise_sep = 1
+wedge = (0, 360)
+
+# SNR source peak
+expected_source_r_px = 87
+source_peak_inner_exclude_px = None
+source_peak_annulus_half_width = 3.0
+
+plot = True
+plot_throughput = True
+plot_contrast = True
+plot_source_peak = True
+force_rerun = False
