@@ -4,4 +4,11 @@ version = "0.1.0"
 description = "tools for MagAO-X dataprocessing"
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "vip-hci",
+    "hciplot",
+    "matplotlib",
+    "numpy",
+    "astropy",
+    "scipy",
+]

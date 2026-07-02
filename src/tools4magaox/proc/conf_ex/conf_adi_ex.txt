@@ -1,0 +1,50 @@
+# Example ADI / PCA config — run after process.py on the same data_dir / cameras
+# python src/tools4magaox/proc/ADI.py src/tools4magaox/redu/conf_ex/conf_adi_ex.txt
+
+redu_path = "/Volumes/magaox_bpic/redu/"
+data_dir = "2025-12-02_062543_beta_pic_coron_lg"
+cameras = ["camsci1"]
+
+# frame selection (default: only process-filtered frames)
+require_used_in_reduction = True
+
+# Step 1 — PSF from reference_sparkles
+psf_crop_size = 30
+psf_norm_size = 19
+
+# Step 2 — ADI cube assembly
+# Crop is specified as radius from center
+crop_r = 120
+coadd_mode = "none"
+frame_coadd_n = 10
+time_coadd_sec = 10.0
+
+# Step 3 — VIP PCA-ADI (tutorial 3.5.1)
+ncomp = 5
+imlib = "vip-fft"
+interpolation = None
+svd_mode = "arpack"
+nproc = None
+# incremental PCA: None = single pass; int = frames per mini-batch; float in (0,1] = memory fraction
+batch = 0.5
+
+# Step 4 — SNR map (None → FWHM from normalize_psf)
+fwhm = None
+
+# Step 5 — optional PCA annulus + PCA grid (VIP tutorial 3.5.6)
+# Runs whenever True, independent of force_rerun
+run_pca_annulus_grid = False
+# source_xy = (58.5, 35.5)
+# pca_annulus_ncomp = 5
+# annulus_width = None
+# r_guess = None
+# pca_grid_range_pcs = (1, 31, 1)
+# pca_grid_modes = ["fullfr", "annular"]
+
+plot = True
+plot_psf = True
+plot_pca = True
+plot_snrmap = True
+plot_parang = True
+force_rerun = False
+chunk_size = 100
