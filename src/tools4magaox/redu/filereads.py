@@ -33,6 +33,33 @@ def _load_fits_primary_float64(path):
     with fits.open(path, memmap=False) as hdul:
         return np.asarray(hdul[0].data, dtype=np.float64)
 
+
+def load_fits_stack(paths, *, dark_data=None, desc="Loading FITS frames", show_progress=True):
+    """
+    Stack primary HDU data from ``paths`` into ``(N, H, W)``.
+
+    Optionally dark-subtract each frame when ``dark_data`` is provided.
+    Shows a tqdm progress bar when loading more than one file.
+    """
+    paths = [os.fspath(p) for p in paths]
+    n = len(paths)
+    if n == 0:
+        return np.zeros((0, 0, 0), dtype=np.float32)
+    dark = None if dark_data is None else np.asarray(dark_data, dtype=np.float32)
+    if dark is not None:
+        h, w = dark.shape
+    else:
+        h, w = _load_fits_primary_float32(paths[0]).shape
+    cube = np.zeros((n, h, w), dtype=np.float32)
+    use_bar = show_progress and n > 1
+    iterator = tqdm(paths, desc=desc, unit="frame", leave=False) if use_bar else paths
+    for i, path in enumerate(iterator):
+        frame = _load_fits_primary_float32(path)
+        if dark is not None:
+            frame = frame - dark
+        cube[i] = frame
+    return cube
+
 def _save_fits_primary_float32(data, path):
     """Save primary HDU data as float32 (reduces RAM vs float64 cubes)."""
     fits.PrimaryHDU(data=np.asarray(data, dtype=np.float32)).writeto(path, overwrite=True)
@@ -321,7 +348,13 @@ def fits_telemetry_table(file_paths, camera=None):
         file_paths = [file_paths]
 
     rows = []
-    for fp in file_paths:
+    file_paths = list(file_paths)
+    iterator = (
+        tqdm(file_paths, desc="Reading FITS headers", unit="file", leave=False)
+        if len(file_paths) > 1
+        else file_paths
+    )
+    for fp in iterator:
         fp = os.fspath(fp)
         name = os.path.basename(fp)
         with fits.open(fp, memmap=False) as fh:
@@ -365,25 +398,26 @@ def make_data_avg_cube(file_list, dark_data, n_avg=1, n_files=-1):
     n_files = len(file_list) if n_files == -1 else n_files
     n_avg_data = n_files // n_avg
     avg_data = np.zeros((n_avg_data, dark_data.shape[0], dark_data.shape[1]), dtype=np.float32)
+    total_reads = n_avg_data * n_avg
+    pbar = tqdm(total=total_reads, desc="Loading coadd science frames", unit="frame", leave=False)
     for i in range(n_avg_data):
-        #if i % 100 == 0:
-        #    print(f"   Processing file {i*n_avg} to {i*n_avg + n_avg} out of {n_files}")
         for j in range(n_avg):
             with fits.open(file_list[i * n_avg + j], memmap=False) as hdul:
                 demo_data = hdul[0].data
             avg_data[i] += np.asarray(demo_data, dtype=np.float32) - dark_data
+            pbar.update(1)
         avg_data[i] /= n_avg
+    pbar.close()
     return avg_data
 
-def make_data_cube(file_list, dark_data, n_files=-1):
-    dark_data = np.asarray(dark_data, dtype=np.float32)
+def make_data_cube(file_list, dark_data, n_files=-1, show_progress=True):
     n_files = len(file_list) if n_files == -1 else n_files
-    data_cube = np.zeros((n_files, dark_data.shape[0], dark_data.shape[1]), dtype=np.float32)
-    for i in range(n_files):
-        with fits.open(file_list[i], memmap=False) as hdul:
-            demo_data = hdul[0].data
-        data_cube[i] = np.asarray(demo_data, dtype=np.float32) - dark_data
-    return data_cube
+    return load_fits_stack(
+        file_list[:n_files],
+        dark_data=dark_data,
+        desc="Loading science cube",
+        show_progress=show_progress,
+    )
 
 # TODO: Make a cube and keep relevant telemetry 
 
@@ -403,7 +437,7 @@ def make_science_cube(file_list, dark_data, n_files=-1, n_start=0):
     parang_cube = np.zeros(n_files)
     time_cube = np.zeros(n_files, dtype='datetime64[us]')
 
-    for i in range(n_files):
+    for i in tqdm(range(n_files), desc="Loading science cube + telemetry", unit="frame", leave=False):
         with fits.open(file_list[n_start+i]) as fh:
             test_data = fh[0].data
             # get the parang
@@ -444,6 +478,8 @@ def make_science_cube_coadd(file_list, dark_data, coadd=10, n_files=-1, n_start=
     parang_cube = np.zeros((n_coadd_files, coadd))
     time_stamp_cube = np.zeros((n_coadd_files, coadd))
 
+    total_reads = n_coadd_files * coadd
+    pbar = tqdm(total=total_reads, desc="Loading coadd science cube", unit="frame", leave=False)
     for i in range(n_coadd_files):
         for j in range(coadd):
             fh = fits.open(file_list[n_start+i*coadd+j])
@@ -458,7 +494,9 @@ def make_science_cube_coadd(file_list, dark_data, coadd=10, n_files=-1, n_start=
             parang_cube[i,j] = pg_ang
             time_stamp_cube[i,j] = time_stamp
             fh.close()
+            pbar.update(1)
         data_cube[i] /= coadd
+    pbar.close()
     return data_cube, parang_cube
 
 

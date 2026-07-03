@@ -12,6 +12,7 @@ import scipy.signal
 from astropy.io import fits
 from scipy import ndimage
 from hcipy import *
+from tqdm import tqdm
 
 from tools4magaox.constants import *
 try:
@@ -674,7 +675,7 @@ def _recenter_complete(file_table_output):
     return bool(np.all(np.isfinite(sy) & np.isfinite(sx)))
 
 
-def data_cube_fom_idxs(file_table_static, idxs, params):
+def data_cube_fom_idxs(file_table_static, idxs, params, show_progress=True):
     obs_path = params["obs_path"]
     data_dir = params["data_dir"]
     camera = params["camera"]
@@ -685,7 +686,7 @@ def data_cube_fom_idxs(file_table_static, idxs, params):
     dark_path = used["masterdark_path"][0]
     dark_data = fr._load_fits_primary_float32(dark_path)
     # 1.2 pulling all files and making cube
-    unsats_data_cube = fr.make_data_cube(unsat_files, dark_data)
+    unsats_data_cube = fr.make_data_cube(unsat_files, dark_data, show_progress=show_progress)
     return unsats_data_cube
 
 
@@ -813,6 +814,17 @@ def _chunk_slices(n, chunk_size):
         yield start, min(start + chunk_size, n)
 
 
+def _iter_frame_chunks(n, chunk_size, desc):
+    """Yield ``(start, end)`` slices with a frame-count progress bar."""
+    if n <= 1:
+        yield from _chunk_slices(n, chunk_size)
+        return
+    with tqdm(total=n, desc=desc, unit="frame", leave=False) as pbar:
+        for start, end in _chunk_slices(n, chunk_size):
+            yield start, end
+            pbar.update(end - start)
+
+
 def _shifts_for_row_idxs(file_table_output, row_idxs):
     sy = np.asarray(file_table_output["shift_y"][row_idxs], dtype=float)
     sx = np.asarray(file_table_output["shift_x"][row_idxs], dtype=float)
@@ -830,25 +842,27 @@ def _collect_peak_idxs_chunked(file_table_static, row_idxs, run_params, chunk_si
 
     n = len(row_idxs)
     peak_idxs = np.zeros((n, 2), dtype=float)
-    for start, end in _chunk_slices(n, chunk_size):
+    for start, end in _iter_frame_chunks(n, chunk_size, "Loading raw frames (max point)"):
         chunk_rows = row_idxs[start:end]
-        raw_cube = data_cube_fom_idxs(file_table_static, chunk_rows, run_params)
+        raw_cube = data_cube_fom_idxs(
+            file_table_static, chunk_rows, run_params, show_progress=False
+        )
         for k, frame in enumerate(raw_cube):
             peak_idxs[start + k] = unravel_index(frame.argmax(), frame.shape)
     return peak_idxs
 
 
-def _load_centered_chunk(file_table_static, chunk_row_idxs, run_params):
+def _load_centered_chunk(
+    file_table_static, chunk_row_idxs, run_params, desc="Loading centered frames", show_progress=True
+):
     """Load a batch of centered FITS frames as a cube."""
     redu_dir = run_params["redu_dir"]
     out_dir = os.path.join(redu_dir, CENTERED_FRAMES_DIR)
-    centered = [
-        fr._load_fits_primary_float32(
-            os.path.join(out_dir, str(file_table_static["filename"][i]))
-        )
+    paths = [
+        os.path.join(out_dir, str(file_table_static["filename"][i]))
         for i in chunk_row_idxs
     ]
-    return np.stack(centered, axis=0)
+    return fr.load_fits_stack(paths, desc=desc, show_progress=show_progress)
 
 
 def _collect_speckle_intensities_chunked(
@@ -857,9 +871,15 @@ def _collect_speckle_intensities_chunked(
     """Load centered frames in chunks and return masked speckle sums."""
     n = len(row_idxs)
     intensities = np.full(n, np.nan, dtype=float)
-    for start, end in _chunk_slices(n, chunk_size):
+    for start, end in _iter_frame_chunks(n, chunk_size, "Loading centered frames (speckle)"):
         chunk_rows = row_idxs[start:end]
-        centered_cube = _load_centered_chunk(file_table_static, chunk_rows, run_params)
+        centered_cube = _load_centered_chunk(
+            file_table_static,
+            chunk_rows,
+            run_params,
+            desc="Loading centered frames (speckle)",
+            show_progress=False,
+        )
         intensities[start:end] = np.sum(centered_cube * speckle_mask, axis=(1, 2))
     return intensities
 
@@ -880,28 +900,38 @@ def _filter_rms_chunked(
     n = len(row_idxs)
     keep = np.ones(n, dtype=bool)
     rms_dev = np.full(n, np.nan, dtype=float)
-    for _ in range(n_iter):
+    for iter_i in tqdm(range(n_iter), desc="RMS filter iterations", leave=False):
         if not np.any(keep):
             break
         good_frame = None
         count = 0
-        for start, end in _chunk_slices(n, chunk_size):
+        mean_desc = f"RMS iter {iter_i + 1}/{n_iter} mean frame"
+        for start, end in _iter_frame_chunks(n, chunk_size, mean_desc):
             chunk_rows = row_idxs[start:end]
             local_keep = keep[start:end]
             if not np.any(local_keep):
                 continue
             centered_cube = _load_centered_chunk(
-                file_table_static, chunk_rows, run_params
+                file_table_static,
+                chunk_rows,
+                run_params,
+                desc=mean_desc,
+                show_progress=False,
             )
             chunk_sum = np.sum(centered_cube[local_keep], axis=0, dtype=np.float64)
             good_frame = chunk_sum if good_frame is None else good_frame + chunk_sum
             count += int(np.sum(local_keep))
         good_frame = good_frame / count
 
-        for start, end in _chunk_slices(n, chunk_size):
+        rms_desc = f"RMS iter {iter_i + 1}/{n_iter} deviations"
+        for start, end in _iter_frame_chunks(n, chunk_size, rms_desc):
             chunk_rows = row_idxs[start:end]
             centered_cube = _load_centered_chunk(
-                file_table_static, chunk_rows, run_params
+                file_table_static,
+                chunk_rows,
+                run_params,
+                desc=rms_desc,
+                show_progress=False,
             )
             for k, frame in enumerate(centered_cube):
                 rms_dev[start + k] = float(np.std(frame - good_frame))

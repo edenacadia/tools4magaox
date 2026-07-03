@@ -3,13 +3,19 @@ import os
 
 import matplotlib.pyplot as plt
 import numpy as np
+from tqdm import tqdm
 
 try:
-    from ..redu.filereads import _coerce_times_to_datetime64, _load_fits_primary_float32
+    from ..redu.filereads import (
+        _coerce_times_to_datetime64,
+        _load_fits_primary_float32,
+        load_fits_stack,
+    )
 except ImportError:
     from tools4magaox.redu.filereads import (
         _coerce_times_to_datetime64,
         _load_fits_primary_float32,
+        load_fits_stack,
     )
 
 
@@ -228,20 +234,20 @@ def load_centered_cube(file_table_static, row_idxs, run_params):
     """Load centered FITS frames for ``row_idxs`` as a (N, H, W) cube."""
     redu_dir = run_params["redu_dir"]
     out_dir = os.path.join(redu_dir, run_params["centered_dir"])
-    frames = [
-        _load_fits_primary_float32(
-            os.path.join(out_dir, str(file_table_static["filename"][i]))
-        )
+    paths = [
+        os.path.join(out_dir, str(file_table_static["filename"][i]))
         for i in row_idxs
     ]
-    return np.stack(frames, axis=0)
+    return load_fits_stack(paths, desc="Loading centered ADI cube")
 
 
 def load_centered_cube_chunked(file_table_static, row_idxs, run_params, chunk_size):
     """Load centered frames in chunks and concatenate into one cube."""
     chunk_size = max(1, int(chunk_size))
     parts = []
-    for start in range(0, len(row_idxs), chunk_size):
+    n = len(row_idxs)
+    chunk_starts = range(0, n, chunk_size)
+    for start in tqdm(chunk_starts, desc="Loading centered cube chunks", unit="chunk", leave=False):
         chunk_rows = row_idxs[start : start + chunk_size]
         parts.append(load_centered_cube(file_table_static, chunk_rows, run_params))
     if not parts:
