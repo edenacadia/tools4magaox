@@ -365,81 +365,151 @@ def s3b_save_first_centered_cube(run_params, file_table_static, file_table_outpu
 # STEP 4 - filtering the new files - save plots, update the table
 def s4_save_statistics(run_params, file_table_static, file_table_output, mask_image):
     """
-    Apply process filters to all centered frames and write per-frame metrics plus
-    ``used_in_reduction`` (1 only when every filter passes).
+    Apply process filters to centered frames.
+
+    With ``force_rerun``, reload images and recompute filter metrics in the table.
+    With ``rerun_filtering`` only, reapply pass/fail using stored metrics and
+    current sigma cutoffs (updates ``used_in_reduction`` only).
     """
     log.info("4. Applying process filters")
-    # needed configuration parameters
     redu_dir = run_params["redu_dir"]
-    force_rerun = run_params["rerun_filtering"]
-    sigma_mp = run_params.get("max_point_sigma_clip", 2.0)
-    sigma_shift = run_params.get("shift_sigma_clip", 2.0)
-    sigma_int = run_params.get("speckle_intensity_sigma_clip", 2.0)
-    sigma_rms = run_params.get("rms_sigma_clip", 2.0)
-    rms_iter = run_params.get("rms_iterations", 3)
+    rerun_filtering = run_params.get("rerun_filtering", False)
+    force_rerun = run_params["force_rerun"]
     output_path = os.path.join(redu_dir, FILE_TABLE_OUTPUT_NAME)
 
     file_table_output = fr.prune_process_output_table(file_table_output)
 
-    if not force_rerun:
-        log.info("=> PROCESS FILTERS ALREADY APPLIED, SKIPPING")
-        return file_table_output
-
-    # Check for centered files
     row_idxs = _process_filter_row_idxs(file_table_static, file_table_output, run_params)
     if len(row_idxs) == 0:
         log.warning("4. No centered frames available for filtering")
         return file_table_output
 
-    chunk_size = run_params.get("chunk_size", 100)
-    speckle_mask = _mask_as_2d(mask_image)
+    metrics_ready = _process_filter_metrics_complete(file_table_output, row_idxs)
+
+    if not force_rerun and not rerun_filtering and metrics_ready:
+        log.info("=> PROCESS FILTERS ALREADY APPLIED, SKIPPING")
+        return file_table_output
+
+    if force_rerun:
+        log.info("=> RECOMPUTING FILTER METRICS (force_rerun)")
+        file_table_output, filter_results = _compute_process_filter_metrics(
+            run_params, file_table_static, file_table_output, mask_image, row_idxs
+        )
+    elif rerun_filtering:
+        if not metrics_ready:
+            log.warning(
+                "4. Filter metrics missing in table; set force_rerun=True to compute from files"
+            )
+            return file_table_output
+        log.info("=> REAPPLYING FILTERS FROM STORED METRICS (rerun_filtering)")
+        file_table_output, filter_results = _reapply_process_filters(
+            file_table_output, row_idxs, run_params
+        )
+    else:
+        log.info("=> COMPUTING FILTER METRICS (first run)")
+        file_table_output, filter_results = _compute_process_filter_metrics(
+            run_params, file_table_static, file_table_output, mask_image, row_idxs
+        )
+
     n = len(row_idxs)
-
-    log.info("=> COLLECTING PEAK IDXS")
-    peak_idxs = _collect_peak_idxs_chunked(
-        file_table_static, row_idxs, run_params, chunk_size
-    )
-    pass_mp, radius = fl.filter_max_point_from_peak_idxs(peak_idxs, sigma_clip=sigma_mp)
-    file_table_output["max_point_radius"][row_idxs] = radius
-
-    log.info("=> COLLECTING SHIFTS")
-    shifts = _shifts_for_row_idxs(file_table_output, row_idxs)
-    pass_cs = fl.filter_center_shifts(shifts, sigma_clip=sigma_shift)
-
-    log.info("=> COLLECTING SPECKLE INTENSITIES")
-    intensities = _collect_speckle_intensities_chunked(
-        file_table_static, row_idxs, run_params, speckle_mask, chunk_size
-    )
-    pass_si, _ = fl.filter_speckle_intensity_values(intensities, sigma_clip=sigma_int)
-    file_table_output["speckle_intensity"][row_idxs] = intensities
-
-    log.info("=> FILTERING RMS")
-    pass_rms, rms_dev = _filter_rms_chunked(
-        file_table_static,
-        row_idxs,
-        run_params,
-        sigma_clip=sigma_rms,
-        n_iter=rms_iter,
-        chunk_size=chunk_size,
-    )
-    file_table_output["rms_deviation"][row_idxs] = rms_dev
-
-    # check against all the filters for which to keep
-    log.info("=> CHECKING AGAINST ALL FILTERS")
-    used = pass_mp & pass_cs & pass_si & pass_rms
-    file_table_output["used_in_reduction"][row_idxs] = used.astype(int)
-
+    used = filter_results["used"]
     log.info(
         "4. used_in_reduction: %s/%s frames",
         int(np.sum(used)),
         n,
     )
 
+    _save_process_filter_plots(
+        run_params, file_table_static, row_idxs, redu_dir, filter_results
+    )
+
+    fr.write_redu_table(fr.prune_process_output_table(file_table_output), output_path)
+    return file_table_output
+
+
+def _compute_process_filter_metrics(
+    run_params, file_table_static, file_table_output, mask_image, row_idxs
+):
+    """Load centered/raw frames and populate filter metric columns."""
+    chunk_size = run_params.get("chunk_size", 100)
+    speckle_mask = _mask_as_2d(mask_image)
+    n = len(row_idxs)
+
+    peak_idxs = _collect_peak_idxs_chunked(
+        file_table_static, row_idxs, run_params, chunk_size
+    )
+    _, radius = fl.filter_max_point_from_peak_idxs(
+        peak_idxs, sigma_clip=run_params.get("max_point_sigma_clip", 2.0)
+    )
+    file_table_output["max_point_radius"][row_idxs] = radius
+
+    intensities = _collect_speckle_intensities_chunked(
+        file_table_static, row_idxs, run_params, speckle_mask, chunk_size
+    )
+    file_table_output["speckle_intensity"][row_idxs] = intensities
+
+    _, rms_dev = _filter_rms_chunked(
+        file_table_static,
+        row_idxs,
+        run_params,
+        sigma_clip=run_params.get("rms_sigma_clip", 2.0),
+        n_iter=run_params.get("rms_iterations", 3),
+        chunk_size=chunk_size,
+    )
+    file_table_output["rms_deviation"][row_idxs] = rms_dev
+
+    file_table_output, filter_results = _reapply_process_filters(
+        file_table_output, row_idxs, run_params
+    )
+    filter_results["radius"] = radius
+    filter_results["intensities"] = intensities
+    filter_results["rms_dev"] = rms_dev
+    return file_table_output, filter_results
+
+
+def _reapply_process_filters(file_table_output, row_idxs, run_params):
+    """Apply filter pass/fail from metrics already in the output table."""
+    radius = np.asarray(file_table_output["max_point_radius"][row_idxs], dtype=float)
+    intensities = np.asarray(file_table_output["speckle_intensity"][row_idxs], dtype=float)
+    rms_dev = np.asarray(file_table_output["rms_deviation"][row_idxs], dtype=float)
+    shifts = _shifts_for_row_idxs(file_table_output, row_idxs)
+
+    pass_mp = fl.filter_max_point_from_radii(
+        radius, sigma_clip=run_params.get("max_point_sigma_clip", 2.0)
+    )
+    pass_cs = fl.filter_center_shifts(
+        shifts, sigma_clip=run_params.get("shift_sigma_clip", 2.0)
+    )
+    pass_si, _ = fl.filter_speckle_intensity_values(
+        intensities, sigma_clip=run_params.get("speckle_intensity_sigma_clip", 2.0)
+    )
+    pass_rms = fl.filter_rms_from_deviations(
+        rms_dev, sigma_clip=run_params.get("rms_sigma_clip", 2.0)
+    )
+
+    used = pass_mp & pass_cs & pass_si & pass_rms
+    file_table_output["used_in_reduction"][row_idxs] = used.astype(int)
+
+    return file_table_output, {
+        "pass_mp": pass_mp,
+        "pass_cs": pass_cs,
+        "pass_si": pass_si,
+        "pass_rms": pass_rms,
+        "used": used,
+        "radius": radius,
+        "shifts": shifts,
+        "intensities": intensities,
+        "rms_dev": rms_dev,
+    }
+
+
+def _save_process_filter_plots(run_params, file_table_static, row_idxs, redu_dir, results):
+    """Write step-4 filter diagnostic plots when enabled in config."""
     td_list = file_table_static["DATE_OBS"][row_idxs]
     if _process_plot_enabled(run_params, "plot_max_point"):
         fl.plot_generic_timeseries(
-            radius,
-            np.where(pass_mp)[0],
+            results["radius"],
+            np.where(results["pass_mp"])[0],
             td_list,
             plot_path=redu_dir,
             plt_title="Max point radius filter",
@@ -447,22 +517,22 @@ def s4_save_statistics(run_params, file_table_static, file_table_output, mask_im
         )
     if _process_plot_enabled(run_params, "plot_center_shift"):
         fl.plot_shift_filter_timeseries(
-            shifts,
-            np.where(pass_cs)[0],
+            results["shifts"],
+            np.where(results["pass_cs"])[0],
             td_list,
             plot_path=redu_dir,
             plt_name="4_shift_filter_timeseries.png",
         )
         fl.plot_shift_filter_scatter(
-            shifts,
-            np.where(pass_cs)[0],
+            results["shifts"],
+            np.where(results["pass_cs"])[0],
             plot_path=redu_dir,
             plt_name="4_shift_filter_scatter.png",
         )
     if _process_plot_enabled(run_params, "plot_speckle_intensity"):
         fl.plot_generic_timeseries(
-            intensities,
-            np.where(pass_si)[0],
+            results["intensities"],
+            np.where(results["pass_si"])[0],
             td_list,
             plot_path=redu_dir,
             plt_title="Speckle intensity filter",
@@ -470,16 +540,13 @@ def s4_save_statistics(run_params, file_table_static, file_table_output, mask_im
         )
     if _process_plot_enabled(run_params, "plot_rms"):
         fl.plot_generic_timeseries(
-            rms_dev,
-            np.where(pass_rms)[0],
+            results["rms_dev"],
+            np.where(results["pass_rms"])[0],
             td_list,
             plot_path=redu_dir,
             plt_title="RMS deviation filter",
             plt_name="4_rms_filter_timeseries.png",
         )
-
-    fr.write_redu_table(fr.prune_process_output_table(file_table_output), output_path)
-    return file_table_output
 
 
 def s4b_save_filtered_centered_cube(run_params, file_table_static, file_table_output):
@@ -970,13 +1037,21 @@ def _process_filter_row_idxs(file_table_static, file_table_output, run_params):
     return np.asarray(row_idxs, dtype=int)
 
 
+def _process_filter_metrics_complete(file_table_output, row_idxs):
+    """True when stored filter metrics exist for every filterable row."""
+    for col in ("max_point_radius", "speckle_intensity", "rms_deviation"):
+        vals = np.asarray(file_table_output[col][row_idxs], dtype=float)
+        if not np.all(np.isfinite(vals)):
+            return False
+    return True
+
+
 def _process_filters_complete(file_table_static, file_table_output, run_params):
-    """True when every filterable row has a computed max-point radius."""
+    """True when filter metrics are computed for all filterable rows."""
     row_idxs = _process_filter_row_idxs(file_table_static, file_table_output, run_params)
     if len(row_idxs) == 0:
         return False
-    radii = np.asarray(file_table_output["max_point_radius"][row_idxs], dtype=float)
-    return bool(np.all(np.isfinite(radii)))
+    return _process_filter_metrics_complete(file_table_output, row_idxs)
 
 
 def _process_plot_enabled(run_params, plot_key):

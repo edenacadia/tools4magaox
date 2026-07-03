@@ -130,6 +130,24 @@ def filter_max_point_from_peak_idxs(peak_idxs, sigma_clip=2.0):
     return pass_mask, np.sqrt(radius_sq, dtype=float)
 
 
+def filter_max_point_from_radii(radius, sigma_clip=2.0):
+    """Reapply max-point filter from stored per-frame radii (no image reload)."""
+    radius = np.asarray(radius, dtype=float)
+    n = radius.size
+    if n == 0:
+        return np.array([], dtype=bool)
+    radius_sq = radius ** 2
+    threshold = np.mean(radius_sq) + sigma_clip * np.std(radius_sq)
+    pass_mask = radius_sq <= threshold
+    log.info(
+        "filter_max_point: sigma_clip=%s kept %s/%s frames (from stored radii)",
+        sigma_clip,
+        int(np.sum(pass_mask)),
+        n,
+    )
+    return pass_mask
+
+
 def filter_center_shifts(shifts, sigma_clip=2.0):
     """
     Keep frames with shift_y and shift_x within ``sigma_clip`` std of the mean
@@ -216,6 +234,24 @@ def filter_rms(data_cube, sigma_clip=2.0, n_iter=3):
         n,
     )
     return idx, rms_deviations
+
+
+def filter_rms_from_deviations(rms_deviations, sigma_clip=2.0):
+    """Reapply RMS filter from stored per-frame deviations (no image reload)."""
+    rms_deviations = np.asarray(rms_deviations, dtype=float)
+    n = rms_deviations.size
+    if n == 0:
+        return np.array([], dtype=bool)
+    ref = np.median(rms_deviations)
+    spread = np.std(rms_deviations)
+    pass_mask = rms_deviations <= ref + sigma_clip * spread
+    log.info(
+        "filter_rms: sigma_clip=%s kept %s/%s frames (from stored deviations)",
+        sigma_clip,
+        int(np.sum(pass_mask)),
+        n,
+    )
+    return pass_mask
 
 #################### plot functions ####################
 
