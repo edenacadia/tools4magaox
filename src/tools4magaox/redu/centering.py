@@ -54,6 +54,34 @@ def gaussian_fit_shifts(data, crop_shape=None, method="minimize"):
     sources_info["gauss_params"] = params
     return shifts, sources_info
 
+def airy_fit_shifts(data, lam_d_px, crop_shape=None, fit_radius_ld=1.5, obscuration=0.0):
+    '''
+    Fit an Airy pattern to the PSF core of each frame and return the shifts
+    ``(dy, dx)`` of the core from the (cropped) frame center ``shape // 2``.
+
+    Only pixels within ``fit_radius_ld`` (in lambda/D) of the brightest pixel of
+    the lightly smoothed frame are fit, so the fit is driven by the core and the
+    first dark ring rather than the aberrated outer rings. ``lam_d_px`` is the
+    initial guess for lambda/D in pixels; it is a free parameter of the fit.
+
+    ``sources_info["gauss_params"]`` holds ``(y0, x0, sigma_y, sigma_x, amplitude, offset)``
+    in the same layout as :func:`gaussian_fit_shifts`, where sigma is the
+    Gaussian-equivalent width of the fitted core (FWHM / 2.355), and
+    ``sources_info["airy_params"]`` holds ``(y0, x0, lam_d_px, amplitude, offset)``.
+    '''
+    cube = check_cube(data)
+    if crop_shape is not None:
+        cube = crop_cube(cube, crop_shape)
+    sources_info = _airy_fit_least_squares(cube, lam_d_px, fit_radius_ld, obscuration)
+    airy = sources_info["airy_params"]
+    h, w = cube.shape[1:]
+    shifts = np.column_stack([airy[:, 0] - h // 2, airy[:, 1] - w // 2])
+    sigma = airy_fwhm_ld(obscuration) * airy[:, 2] / (2 * np.sqrt(2 * np.log(2)))
+    params = np.column_stack([airy[:, 0], airy[:, 1], sigma, sigma, airy[:, 3], airy[:, 4]])
+    params[list(sources_info["bad_idx"])] = np.nan
+    sources_info["gauss_params"] = params
+    return shifts, sources_info
+
 def DAO_fit_shifts(data, crop_shape=None):
     '''
     This function finds the center of the PSF using DAOstarfinder routine
@@ -275,12 +303,68 @@ def _gaussian_xy_centers(sources_list):
     return centers
 
 def _gaussian_xy_shifts(sources_list, frame_shape):
-    # Gaussian fitters return GaussParams; report shifts in (x, y).
+    # Gaussian params start with (y0, x0); shifts are reported as (dy, dx).
     frame_center = (frame_shape[1] // 2, frame_shape[0] // 2)
     if len(sources_list) == 0:
         return np.empty((0, 2), dtype=float)
     centers = np.array([[p[0], p[1]] for p in sources_list], dtype=float)
     return centers - frame_center
+
+############## Airy Functions ##################
+
+def airy_2d(yy, xx, y0, x0, lam_d_px, amplitude, offset, obscuration=0.0):
+    '''
+    Airy pattern of a circular pupil with fractional central obscuration
+    ``obscuration``, centered at (y0, x0) with lambda/D = ``lam_d_px`` pixels.
+    '''
+    eps = float(obscuration)
+    v = np.pi * np.hypot(yy - y0, xx - x0) / lam_d_px
+    field = _airy_amplitude(v)
+    if eps > 0:
+        field = (field - eps**2 * _airy_amplitude(eps * v)) / (1 - eps**2)
+    return amplitude * field**2 + offset
+
+def _airy_amplitude(v):
+    '''2 J1(v) / v, equal to 1 at v = 0.'''
+    v = np.asarray(v, dtype=float)
+    out = np.ones_like(v)
+    nz = v > 1e-8
+    out[nz] = 2 * scipy.special.j1(v[nz]) / v[nz]
+    return out
+
+def airy_fwhm_ld(obscuration=0.0):
+    '''FWHM of the Airy core in lambda/D (1.029 for an unobscured pupil).'''
+    v = np.linspace(0, 2 * np.pi, 20001)
+    prof = airy_2d(0.0, v / np.pi, 0.0, 0.0, 1.0, 1.0, 0.0, obscuration)
+    return 2 * v[np.argmax(prof < 0.5)] / np.pi
+
+def _airy_fit_least_squares(cube, lam_d_px, fit_radius_ld, obscuration):
+    cube = np.asarray(cube, dtype=float)
+    yy, xx = np.indices(cube.shape[1:])
+    radius_px = fit_radius_ld * lam_d_px
+    bad_idx = []
+    params = np.full((len(cube), 5), np.nan, dtype=float)
+
+    for i, frame in enumerate(tqdm(cube)):
+        y_g, x_g = np.unravel_index(np.argmax(ndimage.gaussian_filter(frame, 1)), frame.shape)
+        sel = np.hypot(yy - y_g, xx - x_g) <= radius_px
+        ys, xs, vals = yy[sel], xx[sel], frame[sel]
+        offset_guess = np.median(frame)
+        p0 = (y_g, x_g, lam_d_px, frame[y_g, x_g] - offset_guess, offset_guess)
+        lower = (y_g - lam_d_px, x_g - lam_d_px, 0.5 * lam_d_px, 0.0, -np.inf)
+        upper = (y_g + lam_d_px, x_g + lam_d_px, 2.0 * lam_d_px, np.inf, np.inf)
+
+        def resid(p):
+            return airy_2d(ys, xs, *p, obscuration=obscuration) - vals
+
+        try:
+            fit = scipy.optimize.least_squares(resid, p0, bounds=(lower, upper), x_scale="jac")
+            if not fit.success:
+                bad_idx.append(i)
+            params[i] = fit.x
+        except Exception:
+            bad_idx.append(i)
+    return {"bad_idx": bad_idx, "airy_params": params}
 
 ############ Shifting Functions ################
 

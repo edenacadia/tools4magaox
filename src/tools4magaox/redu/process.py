@@ -1186,30 +1186,6 @@ def run_process_from_config(params, config_source_path=None):
             log.exception("Error processing %s %s", data_dir, camera)
 
 
-def _resolve_wavelength_for_camera(params, camera):
-    """
-    Return wavelength in metres for ``camera``.
-
-    ``wavelength`` may be a scalar (all cameras) or a list/tuple in the same
-    order as ``cameras`` (e.g. ``[camsci1_wl, camsci2_wl]``).
-    """
-    wl = params.get("wavelength", 908e-9)
-    if isinstance(wl, (list, tuple)):
-        cameras = list(params.get("cameras", []))
-        if camera not in cameras:
-            raise ValueError(
-                f"wavelength is a list but {camera!r} is not listed in cameras={cameras}"
-            )
-        idx = cameras.index(camera)
-        if idx >= len(wl):
-            raise ValueError(
-                f"wavelength list length {len(wl)} is too short for {camera!r} "
-                f"(index {idx} in cameras={cameras})"
-            )
-        return float(wl[idx])
-    return float(wl)
-
-
 def build_process_run_params(
     params,
     camera,
@@ -1263,7 +1239,7 @@ def build_process_run_params(
     p.setdefault("rms_sigma_clip", 2.0)
     p.setdefault("rms_max", None)
     p.setdefault("rms_iterations", 3)
-    p["wavelength"] = _resolve_wavelength_for_camera(p, camera)
+    p["wavelength"] = fr.resolve_wavelength_for_camera(p, camera)
     if config_source_path is not None:
         p["config_source_path"] = config_source_path
     return p

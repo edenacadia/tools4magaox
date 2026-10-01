@@ -81,6 +81,30 @@ def write_redu_table(table, path):
     table.write(path, format=_REDU_ASCII_FMT, overwrite=True)
 
 
+def resolve_wavelength_for_camera(params, camera):
+    """
+    Return wavelength in metres for ``camera``.
+
+    ``wavelength`` may be a scalar (all cameras) or a list/tuple in the same
+    order as ``cameras`` (e.g. ``[camsci1_wl, camsci2_wl]``).
+    """
+    wl = params.get("wavelength", 908e-9)
+    if isinstance(wl, (list, tuple)):
+        cameras = list(params.get("cameras", []))
+        if camera not in cameras:
+            raise ValueError(
+                f"wavelength is a list but {camera!r} is not listed in cameras={cameras}"
+            )
+        idx = cameras.index(camera)
+        if idx >= len(wl):
+            raise ValueError(
+                f"wavelength list length {len(wl)} is too short for {camera!r} "
+                f"(index {idx} in cameras={cameras})"
+            )
+        return float(wl[idx])
+    return float(wl)
+
+
 def find_camera_files(obs_path, obs_dir, camera="camsci1", max_files=-1):
     """
     Find FITS files in ``{obs_path}{obs_dir}/{camera}/`` and return sorted paths.

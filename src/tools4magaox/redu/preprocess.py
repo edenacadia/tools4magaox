@@ -187,7 +187,13 @@ def s2_make_centered_cube(run_params, clean_cube_path, file_table_static, file_t
         4. update ``file_table_output`` with per-frame filters, shifts, and Gaussian fits
 
     Reads from ``run_params``: ``redu_dir``, ``pct_cut``, ``force_rerun``, ``plot``,
-    ``crop_shape``, ``fit_func``.
+    ``crop_shape``, ``fit_func``, ``wavelength``, ``airy_fit_radius_ld``,
+    ``airy_obscuration``, ``jitter_match_exptime``.
+
+    With ``jitter_match_exptime`` set (the sats' exposure time), consecutive frames
+    are mean-coadded without registration to that exposure time before the core
+    fit, so the average image carries the same jitter as one sat frame. Every
+    frame in a coadd is shifted by that coadd's fit.
     '''
     redu_dir = run_params["redu_dir"]
     pct_cut = run_params["pct_cut"]
@@ -212,24 +218,52 @@ def s2_make_centered_cube(run_params, clean_cube_path, file_table_static, file_t
         unsats_data_cube = _load_fits_primary_float32(clean_cube_path)
         # 2.0 filter the cube based on max peaks
         max_values, good_idxs = fl.filter_max_value(unsats_data_cube, perc=pct_cut)
+        good_idxs = np.asarray(good_idxs, dtype=int)
         if save_plot:
             # Keep DATE_OBS aligned with the clean cube ordering (to_use == 1).
             td_list = _date_obs_for_centering(file_table_static, file_table_output)
             fl.plot_max_filter_timeseries(max_values, good_idxs, td_list, perc=pct_cut, plot_path=redu_dir)
             fl.plot_max_filter_hist(max_values, good_idxs, perc=pct_cut, plot_path=redu_dir)
-        # 2.1 find the shifts for the remaining frames
-        if fit_func == "gauss_min":
-            shifts, info_dict = ct.gaussian_fit_shifts(unsats_data_cube[good_idxs], crop_shape=crop_shape, method="minimize")
+        # 2.1 jitter matching: coadd consecutive frames (unregistered) up to the sats' exposure time
+        coadd_n = _jitter_coadd_n(run_params, file_table_static, file_table_output)
+        groups = _consecutive_groups(len(good_idxs), coadd_n)
+        fit_cube = np.stack(
+            [np.mean(unsats_data_cube[good_idxs[g]], axis=0) for g in groups]
+        )
+        log.info(
+            "-> fitting %s coadds of up to %s frames (%s frames)",
+            len(groups), coadd_n, len(good_idxs),
+        )
+        # 2.2 find the core position of each coadd
+        if fit_func == "airy":
+            lam_d_px = _lam_d_px(run_params["wavelength"])
+            group_shifts, info_dict = ct.airy_fit_shifts(
+                fit_cube,
+                lam_d_px,
+                crop_shape=crop_shape,
+                fit_radius_ld=run_params["airy_fit_radius_ld"],
+                obscuration=run_params["airy_obscuration"],
+            )
+            airy = info_dict["airy_params"]
+            log.info(
+                "-> Airy fit: median lambda/D = %.3f px (guess %.3f), %s failed fits",
+                np.nanmedian(airy[:, 2]), lam_d_px, len(info_dict["bad_idx"]),
+            )
+        elif fit_func == "gauss_min":
+            group_shifts, info_dict = ct.gaussian_fit_shifts(fit_cube, crop_shape=crop_shape, method="minimize")
         elif fit_func == "gauss_curvefit":
-            shifts, info_dict = ct.gaussian_fit_shifts(unsats_data_cube[good_idxs], crop_shape=crop_shape, method="curvefit")
+            group_shifts, info_dict = ct.gaussian_fit_shifts(fit_cube, crop_shape=crop_shape, method="curvefit")
         else:
             raise ValueError(f"Invalid fit function: {fit_func}")
+        # every frame in a coadd gets that coadd's shift and fit parameters
+        member_group = np.concatenate([np.full(len(g), k) for k, g in enumerate(groups)])
+        shifts = np.asarray(group_shifts, dtype=float)[member_group]
         # 2.3 center frames using the shifts
         centered_data_cube = ct.shift_cube(unsats_data_cube[good_idxs], -shifts)
         # 2.4 update/write file table
         gauss_params = None
-        if isinstance(info_dict, dict):
-            gauss_params = info_dict.get("gauss_params")
+        if isinstance(info_dict, dict) and info_dict.get("gauss_params") is not None:
+            gauss_params = np.asarray(info_dict["gauss_params"], dtype=float)[member_group]
         _update_file_table_output_step2(file_table_output,max_values,
             good_idxs,
             shifts,
@@ -310,7 +344,7 @@ def s3_make_average_image(run_params, centered_file_table, file_table_static, fi
                 good_idxs,
                 td_list,
                 plot_path=redu_dir,
-                plt_title="Gaussian fit amplitudes",
+                plt_title="Core fit amplitudes",
                 plt_name="3_gauss_amp_filter_timeseries.png",
             )
         # 3.1 Average the remaing frames (accumulate in float32)
@@ -487,7 +521,12 @@ def _update_file_table_output_step2(
     shifts,
     gauss_params,
 ):
-    """Fill centering / Gaussian columns for rows that passed majority (step 1)."""
+    """
+    Fill centering / core-fit columns for rows that passed majority (step 1).
+
+    ``shifts`` are ``(dy, dx)``. ``gauss_*`` hold the core fit for either fitter;
+    for the Airy fit the sigmas are the Gaussian-equivalent core width.
+    """
     pass_maj = np.asarray(file_table_output["pass_majority_config"], dtype=int)
     used_rows = np.flatnonzero(pass_maj == 1)
     n_used = len(used_rows)
@@ -508,8 +547,8 @@ def _update_file_table_output_step2(
         gp = np.asarray(gauss_params, dtype=float)
     for k, clean_idx in enumerate(g):
         gr = int(used_rows[int(clean_idx)])
-        file_table_output["shift_x"][gr] = float(s[k, 0])
-        file_table_output["shift_y"][gr] = float(s[k, 1])
+        file_table_output["shift_y"][gr] = float(s[k, 0])
+        file_table_output["shift_x"][gr] = float(s[k, 1])
         if gp is not None and gp.ndim == 2 and gp.shape[1] >= 6:
             file_table_output["gauss_y"][gr] = float(gp[k, 0])
             file_table_output["gauss_x"][gr] = float(gp[k, 1])
@@ -567,6 +606,31 @@ def _subset_table_with_average_pass_flags(
     out["used_in_average"] = used_avg
     return out
 
+
+def _lam_d_px(wavelength):
+    """lambda/D in camsci pixels for the Magellan aperture."""
+    return wavelength / 6.5 * RAD_TO_AS / CS_PLATESCALE
+
+def _jitter_coadd_n(run_params, file_table_static, file_table_output):
+    """
+    Number of consecutive unsat frames to coadd so their total exposure matches
+    ``jitter_match_exptime`` (1 when unset or not longer than one unsat frame).
+    """
+    target = run_params.get("jitter_match_exptime")
+    if target is None:
+        return 1
+    maj = np.asarray(file_table_output["pass_majority_config"], dtype=int) == 1
+    unsat_exptime = float(np.median(np.asarray(file_table_static["EXPTIME"], dtype=float)[maj]))
+    n = max(1, int(round(float(target) / unsat_exptime)))
+    log.info(
+        "-> jitter matching: sats EXPTIME %.6g s / unsat EXPTIME %.6g s -> coadd %s frames",
+        float(target), unsat_exptime, n,
+    )
+    return n
+
+def _consecutive_groups(n_frames, coadd_n):
+    """Index arrays of consecutive frames, ``coadd_n`` per group (last may be shorter)."""
+    return [np.arange(s, min(s + coadd_n, n_frames)) for s in range(0, n_frames, coadd_n)]
 
 ###################### STEP 3 helper functions ######################
 
@@ -846,7 +910,11 @@ def build_preprocess_run_params(
     p.setdefault("plot", False)
     p.setdefault("max_files", -1)
     p.setdefault("force_rerun", False)
-    p.setdefault("fit_func", "gauss_min")
+    p.setdefault("fit_func", "airy")
+    p["wavelength"] = fr.resolve_wavelength_for_camera(p, camera)
+    p.setdefault("airy_fit_radius_ld", 1.5)
+    p.setdefault("airy_obscuration", 0.0)
+    p.setdefault("jitter_match_exptime", None)
     if "crop_shape" not in p and p.get("crop_size") is not None:
         p["crop_shape"] = p["crop_size"]
     p.setdefault("crop_shape", None)

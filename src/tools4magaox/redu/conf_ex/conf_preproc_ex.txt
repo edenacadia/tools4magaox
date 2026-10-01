@@ -11,7 +11,15 @@ cameras = ["camsci1", "camsci2"]
 
 plot = True
 force_rerun = False
-fit_func = "gauss_min"
+# core fit for centering: "airy" (default), "gauss_min", or "gauss_curvefit"
+fit_func = "airy"
+wavelength = 908e-9         # initial lambda/D guess; list in ``cameras`` order allowed
+airy_fit_radius_ld = 1.5    # fit only pixels within this many lambda/D of the core
+airy_obscuration = 0.0      # fractional central obscuration of the Airy model
+
+# jitter matching: sats' EXPTIME (s). Consecutive unsat frames are coadded without
+# registration to this exposure before the core fit. Unset = no coadding.
+# jitter_match_exptime = 0.115057
 
 max_files = -1
 pct_cut = 20
