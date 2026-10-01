@@ -148,10 +148,13 @@ def filter_max_point_from_radii(radius, sigma_clip=2.0):
     return pass_mask
 
 
-def filter_center_shifts(shifts, sigma_clip=2.0):
+def filter_center_shifts(shifts, sigma_clip=2.0, px_max=None):
     """
-    Keep frames with shift_y and shift_x within ``sigma_clip`` std of the mean
-    (process ``filter_center_shifts``; shifts are ``[shift_y, shift_x]``).
+    Keep frames with shift_y and shift_x near the mean (process step 4).
+
+    When ``px_max`` is set, each component must lie within ``mean ± px_max``
+    pixels. Otherwise, components must lie within ``sigma_clip`` standard
+    deviations of the mean. Shifts are ``[shift_y, shift_x]``.
     """
     shifts = np.asarray(shifts, dtype=float)
     n = shifts.shape[0]
@@ -161,12 +164,18 @@ def filter_center_shifts(shifts, sigma_clip=2.0):
     sx = shifts[:, 1]
     sy_mean, sy_std = np.mean(sy), np.std(sy)
     sx_mean, sx_std = np.mean(sx), np.std(sx)
-    pass_y = (sy > sy_mean - sigma_clip * sy_std) & (sy < sy_mean + sigma_clip * sy_std)
-    pass_x = (sx > sx_mean - sigma_clip * sx_std) & (sx < sx_mean + sigma_clip * sx_std)
+    if px_max is not None:
+        pass_y = (sy >= sy_mean - px_max) & (sy <= sy_mean + px_max)
+        pass_x = (sx >= sx_mean - px_max) & (sx <= sx_mean + px_max)
+        cutoff_desc = f"px_max={px_max}"
+    else:
+        pass_y = (sy > sy_mean - sigma_clip * sy_std) & (sy < sy_mean + sigma_clip * sy_std)
+        pass_x = (sx > sx_mean - sigma_clip * sx_std) & (sx < sx_mean + sigma_clip * sx_std)
+        cutoff_desc = f"sigma_clip={sigma_clip}"
     pass_mask = pass_y & pass_x
     log.info(
-        "filter_center_shifts: sigma_clip=%s kept %s/%s frames",
-        sigma_clip,
+        "filter_center_shifts: %s kept %s/%s frames",
+        cutoff_desc,
         int(np.sum(pass_mask)),
         n,
     )
@@ -206,9 +215,81 @@ def filter_speckle_intensity_values(intensities, sigma_clip=2.0):
     return pass_mask, intensities
 
 
-def filter_rms(data_cube, sigma_clip=2.0, n_iter=3):
+def rms_pass_mask(rms_deviations, *, sigma_clip=2.0, max_value=None):
+    """Return boolean mask for RMS deviation cutoff (sigma clip or absolute max)."""
+    if max_value is not None:
+        return rms_deviations <= max_value
+    ref = np.median(rms_deviations)
+    spread = np.std(rms_deviations)
+    return rms_deviations <= ref + sigma_clip * spread
+
+
+def rms_cutoff_threshold(rms_deviations, *, sigma_clip=2.0, max_value=None):
+    """Upper RMS cutoff used by :func:`rms_pass_mask`, for plotting."""
+    rms_deviations = np.asarray(rms_deviations, dtype=float)
+    if max_value is not None:
+        return float(max_value), f"max={max_value}"
+    ref = float(np.median(rms_deviations))
+    spread = float(np.std(rms_deviations))
+    threshold = ref + sigma_clip * spread
+    return threshold, f"median+{sigma_clip}σ={threshold:.4g}"
+
+
+def center_shift_cutoffs(shifts, sigma_clip=2.0, shift_px_max=None):
+    """Per-axis shift cutoffs matching :func:`filter_center_shifts`."""
+    shifts = np.asarray(shifts, dtype=float)
+    sy_mean = float(np.mean(shifts[:, 0]))
+    sx_mean = float(np.mean(shifts[:, 1]))
+    if shift_px_max is not None:
+        half_y = half_x = float(shift_px_max)
+        label = f"±{shift_px_max} px"
+    else:
+        half_y = float(sigma_clip * np.std(shifts[:, 0]))
+        half_x = float(sigma_clip * np.std(shifts[:, 1]))
+        label = f"{sigma_clip}σ"
+    return {
+        "sy_mean": sy_mean,
+        "sx_mean": sx_mean,
+        "sy_lo": sy_mean - half_y,
+        "sy_hi": sy_mean + half_y,
+        "sx_lo": sx_mean - half_x,
+        "sx_hi": sx_mean + half_x,
+        "label": label,
+    }
+
+
+def _plot_shift_cutoff_box(ax, cutoffs):
+    """Draw per-axis shift cutoffs as red lines on a scatter axes."""
+    label = f"cutoff ({cutoffs['label']})"
+    ax.axhline(cutoffs["sy_lo"], color="r", ls="--", lw=1, label=label)
+    ax.axhline(cutoffs["sy_hi"], color="r", ls="--", lw=1)
+    ax.axvline(cutoffs["sx_lo"], color="r", ls="--", lw=1)
+    ax.axvline(cutoffs["sx_hi"], color="r", ls="--", lw=1)
+
+
+def _plot_radial_shift_cutoff(ax, shifts, px_max):
+    """Draw radial shift cutoff circle on a scatter axes (preprocess filter)."""
+    shifts = np.asarray(shifts, dtype=float)
+    mean_y, mean_x = np.mean(shifts[:, 0]), np.mean(shifts[:, 1])
+    circle = plt.Circle(
+        (mean_x, mean_y),
+        px_max,
+        fill=False,
+        color="r",
+        ls="--",
+        lw=1,
+        label=f"r_max={px_max}",
+    )
+    ax.add_patch(circle)
+    ax.autoscale_view()
+
+
+def filter_rms(data_cube, sigma_clip=2.0, n_iter=3, max_value=None):
     """
     Iteratively reject frames with high RMS residual vs the mean of survivors.
+
+    When ``max_value`` is set, keep frames with RMS deviation at or below that
+    absolute cutoff. Otherwise use ``sigma_clip`` relative to the median spread.
     """
     data_cube = np.asarray(data_cube)
     n = data_cube.shape[0]
@@ -223,12 +304,15 @@ def filter_rms(data_cube, sigma_clip=2.0, n_iter=3):
         rms_deviations = np.array(
             [float(np.std(frame - good_frame)) for frame in data_cube], dtype=float
         )
-        ref = np.median(rms_deviations)
-        spread = np.std(rms_deviations)
-        idx = rms_deviations <= ref + sigma_clip * spread
+        idx = rms_pass_mask(
+            rms_deviations, sigma_clip=sigma_clip, max_value=max_value
+        )
+    cutoff_desc = (
+        f"max_value={max_value}" if max_value is not None else f"sigma_clip={sigma_clip}"
+    )
     log.info(
-        "filter_rms: sigma_clip=%s n_iter=%s kept %s/%s frames",
-        sigma_clip,
+        "filter_rms: %s n_iter=%s kept %s/%s frames",
+        cutoff_desc,
         n_iter,
         int(np.sum(idx)),
         n,
@@ -236,18 +320,21 @@ def filter_rms(data_cube, sigma_clip=2.0, n_iter=3):
     return idx, rms_deviations
 
 
-def filter_rms_from_deviations(rms_deviations, sigma_clip=2.0):
+def filter_rms_from_deviations(rms_deviations, sigma_clip=2.0, max_value=None):
     """Reapply RMS filter from stored per-frame deviations (no image reload)."""
     rms_deviations = np.asarray(rms_deviations, dtype=float)
     n = rms_deviations.size
     if n == 0:
         return np.array([], dtype=bool)
-    ref = np.median(rms_deviations)
-    spread = np.std(rms_deviations)
-    pass_mask = rms_deviations <= ref + sigma_clip * spread
+    pass_mask = rms_pass_mask(
+        rms_deviations, sigma_clip=sigma_clip, max_value=max_value
+    )
+    cutoff_desc = (
+        f"max_value={max_value}" if max_value is not None else f"sigma_clip={sigma_clip}"
+    )
     log.info(
-        "filter_rms: sigma_clip=%s kept %s/%s frames (from stored deviations)",
-        sigma_clip,
+        "filter_rms: %s kept %s/%s frames (from stored deviations)",
+        cutoff_desc,
         int(np.sum(pass_mask)),
         n,
     )
@@ -255,7 +342,16 @@ def filter_rms_from_deviations(rms_deviations, sigma_clip=2.0):
 
 #################### plot functions ####################
 
-def plot_generic_timeseries(values, good_idxs, timeseries_list, plot_path="", plt_title="timeseries", plt_name="generic_filter_timeseries.png"):
+def plot_generic_timeseries(
+    values,
+    good_idxs,
+    timeseries_list,
+    plot_path="",
+    plt_title="timeseries",
+    plt_name="generic_filter_timeseries.png",
+    cutoff_high=None,
+    cutoff_label=None,
+):
     obs_name =  plot_path.split("/")[-2] + " " + plot_path.split("/")[-3]
     values = np.asarray(values, dtype=float)
     g = np.asarray(good_idxs, dtype=int)
@@ -266,6 +362,12 @@ def plot_generic_timeseries(values, good_idxs, timeseries_list, plot_path="", pl
     plt.ylabel("Value")
     plt.plot(t, values, "o", label="discarded frames", alpha=0.1, color="gray", markersize=4)
     plt.plot(t[g], values[g], "o",label="good frames", alpha=0.5, markersize=4)
+    if cutoff_high is not None:
+        plt.axhline(
+            cutoff_high,
+            color="r",
+            label=cutoff_label or f"cutoff={cutoff_high:.4g}",
+        )
     plt.legend()
     # save
     timeseries_file = os.path.join(plot_path, plt_name) if plot_path else plt_name
@@ -324,7 +426,16 @@ def plot_max_filter_hist(max_values, good_idxs, perc=10, plot_path="", plt_name=
 
 ###########################################################################
 
-def plot_shift_filter_timeseries(shifts, good_idxs, timeseries_list, px_max=10, plot_path="", plt_name="3_shift_filter_timeseries.png"):
+def plot_shift_filter_timeseries(
+    shifts,
+    good_idxs,
+    timeseries_list,
+    px_max=None,
+    sigma_clip=None,
+    shift_px_max=None,
+    plot_path="",
+    plt_name="3_shift_filter_timeseries.png",
+):
     obs_name =  plot_path.split("/")[-2] + " " + plot_path.split("/")[-3]
     shifts = np.asarray(shifts, dtype=float)
     g = np.asarray(good_idxs, dtype=int)
@@ -342,6 +453,41 @@ def plot_shift_filter_timeseries(shifts, good_idxs, timeseries_list, px_max=10, 
     plt.plot(t, shifts[:, 1], "o", alpha=0.1, color="gray", markersize=4)
     plt.plot(t[g], shifts[g, 0], "o", label="y shift", alpha=0.5, markersize=4)
     plt.plot(t[g], shifts[g, 1], "o", label="x shift", alpha=0.5, markersize=4)
+    if shift_px_max is not None or sigma_clip is not None:
+        cutoffs = center_shift_cutoffs(
+            shifts, sigma_clip=sigma_clip or 2.0, shift_px_max=shift_px_max
+        )
+        plt.axhline(
+            cutoffs["sy_lo"],
+            color="r",
+            ls="--",
+            lw=1,
+            label=f"y cutoff ({cutoffs['label']})",
+        )
+        plt.axhline(cutoffs["sy_hi"], color="r", ls="--", lw=1)
+        plt.axhline(
+            cutoffs["sx_lo"],
+            color="r",
+            ls=":",
+            lw=1,
+            label=f"x cutoff ({cutoffs['label']})",
+        )
+        plt.axhline(cutoffs["sx_hi"], color="r", ls=":", lw=1)
+    elif px_max is not None:
+        mean_shift = np.mean(shifts, axis=0)
+        radial = np.sqrt(
+            (shifts[:, 0] - mean_shift[0]) ** 2 + (shifts[:, 1] - mean_shift[1]) ** 2
+        )
+        plt.plot(
+            t,
+            radial,
+            ".",
+            alpha=0.2,
+            color="orange",
+            label="|shift - mean|",
+            markersize=3,
+        )
+        plt.axhline(px_max, color="r", label=f"r_max={px_max}")
     plt.legend()
     # save
     timeseries_file = os.path.join(plot_path, plt_name) if plot_path else plt_name
@@ -350,7 +496,15 @@ def plot_shift_filter_timeseries(shifts, good_idxs, timeseries_list, px_max=10, 
     log.info("Saved shift filter timeseries to %s", timeseries_file)
     return
 
-def plot_shift_filter_scatter(shifts, good_idxs, px_max=10, plot_path="", plt_name="3_shift_filter_scatter.png"):
+def plot_shift_filter_scatter(
+    shifts,
+    good_idxs,
+    px_max=None,
+    sigma_clip=None,
+    shift_px_max=None,
+    plot_path="",
+    plt_name="3_shift_filter_scatter.png",
+):
     obs_name =  plot_path.split("/")[-2] + " " + plot_path.split("/")[-3]
     # TODO: fix, a little repetative
     shifts = np.asarray(shifts, dtype=float)
@@ -361,6 +515,14 @@ def plot_shift_filter_scatter(shifts, good_idxs, px_max=10, plot_path="", plt_na
     plt.ylabel("y shift")
     plt.scatter(shifts[:, 1], shifts[:, 0], alpha=0.1, color="gray")
     plt.scatter(shifts[g, 1], shifts[g, 0], alpha=0.5, label="good shifts")
+    ax = plt.gca()
+    if shift_px_max is not None or sigma_clip is not None:
+        cutoffs = center_shift_cutoffs(
+            shifts, sigma_clip=sigma_clip or 2.0, shift_px_max=shift_px_max
+        )
+        _plot_shift_cutoff_box(ax, cutoffs)
+    elif px_max is not None:
+        _plot_radial_shift_cutoff(ax, shifts, px_max)
     plt.legend()
     # save
     scatter_file = os.path.join(plot_path, plt_name) if plot_path else plt_name
