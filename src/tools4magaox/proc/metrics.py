@@ -152,28 +152,13 @@ def load_metrics_inputs(
     adi_dir = run_params["adi_dir"]
     force_rerun = run_params["force_rerun"]
 
-    psf_norm_path = os.path.join(adi_dir, ADI.PSF_NORMALIZED_NAME)
-    fwhm_path = os.path.join(adi_dir, ADI.PSF_FWHM_NAME)
     cube_path = os.path.join(adi_dir, ADI.ADI_CUBE_NAME)
     parang_path = os.path.join(adi_dir, ADI.ADI_PARANG_NAME)
     pca_path = os.path.join(adi_dir, ADI.ADI_PCA_NAME)
     snr_path = os.path.join(adi_dir, ADI.ADI_SNRMAP_NAME)
 
-    if (
-        not force_rerun
-        and os.path.isfile(psf_norm_path)
-        and os.path.isfile(fwhm_path)
-    ):
-        log.info("=> LOADING PSF from ADI")
-        psfn = fr._load_fits_primary_float32(psf_norm_path)
-        if run_params.get("fwhm_override") is not None:
-            fwhm = float(run_params["fwhm_override"])
-        else:
-            with open(fwhm_path, encoding="utf-8") as fh:
-                fwhm = float(fh.read().strip())
-    else:
-        log.info("=>  => BUILDING PSF via ADI step 1")
-        psfn, fwhm = ADI.s1_build_psf(run_params)
+    # ADI step 1 reuses its cached PSF only when it was built from the current unsat average.
+    psfn, fwhm = ADI.s1_build_psf(run_params)
 
     if (
         not force_rerun
@@ -553,11 +538,10 @@ def _derive_starphot(run_params, file_table_static, file_table_output):
     Scales the PSF integrated flux by the median science EXPTIME divided by the
     reference PSF EXPTIME.
     """
-    redu_dir = run_params["redu_dir"]
     psf_crop_size = int(run_params.get("psf_crop_size", 30))
     psf_norm_size = int(run_params.get("psf_norm_size", 19))
 
-    ref_path = os.path.join(redu_dir, ADI.REFERENCE_IMAGE_NAME)
+    ref_path = ADI.resolve_psf_source_path(run_params)
     reference = fr._load_fits_primary_float32(ref_path)
     psf_crop = pu.center_crop_2d(reference, psf_crop_size)
     _psfn, flux, _fwhm = normalize_psf(
@@ -566,7 +550,7 @@ def _derive_starphot(run_params, file_table_static, file_table_output):
         debug=False,
         full_output=True,
     )
-    flux = float(flux)
+    flux = float(np.ravel(flux)[0])
 
     row_idxs = pu.select_adi_frame_rows(
         file_table_static, file_table_output, run_params

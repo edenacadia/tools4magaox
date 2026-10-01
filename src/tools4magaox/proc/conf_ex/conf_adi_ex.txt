@@ -8,7 +8,8 @@ cameras = ["camsci1"]
 # frame selection (default: only process-filtered frames)
 require_used_in_reduction = True
 
-# Step 1 — PSF from reference_sparkles
+# Step 1 — PSF from the unsat average_image.fits
+# psf_unsats_dir = "2025-12-02_065035_beta_pic_coron_lg_unsats"  # default: unsats_dir in process_config.txt
 psf_crop_size = 30
 psf_norm_size = 19
 

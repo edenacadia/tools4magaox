@@ -25,7 +25,9 @@ ADI_OUTPUT_DIR = "adi"
 ADI_CONFIG_SNAPSHOT_NAME = "adi_config.txt"
 ADI_LOG_NAME = "adi.log"
 PSF_FWHM_NAME = "psf_fwhm.txt"
-REFERENCE_IMAGE_NAME = "reference_sparkles.fits"
+PSF_SOURCE_NAME = "psf_source.txt"
+UNSAT_AVERAGE_IMAGE_NAME = "average_image.fits"
+PROCESS_CONFIG_SNAPSHOT_NAME = "process_config.txt"
 FILE_TABLE_NAME = "file_table.txt"
 FILE_TABLE_OUTPUT_NAME = "file_table_output.txt"
 CENTERED_FRAMES_DIR = "centered"
@@ -114,7 +116,8 @@ def adi_main(run_params):
 
 def s1_build_psf(run_params):
     """
-    Crop ``reference_sparkles.fits`` to 30×30 and VIP-normalize the PSF.
+    Crop the unsat average image (see :func:`resolve_psf_source_path`) to
+    ``psf_crop_size`` and VIP-normalize the PSF.
 
     Returns
     -------
@@ -123,18 +126,22 @@ def s1_build_psf(run_params):
     fwhm : float
         Mean FWHM from ``normalize_psf``.
     """
-    log.info("1. Building PSF from reference_sparkles")
-    redu_dir = run_params["redu_dir"]
     adi_dir = run_params["adi_dir"]
     force_rerun = run_params["force_rerun"]
     psf_crop_size = int(run_params["psf_crop_size"])
     psf_norm_size = int(run_params["psf_norm_size"])
 
-    ref_path = os.path.join(redu_dir, REFERENCE_IMAGE_NAME)
+    ref_path = resolve_psf_source_path(run_params)
+    log.info("1. Building PSF from unsat average %s", ref_path)
     psf_crop_path = os.path.join(adi_dir, PSF_30X30_NAME)
     psf_norm_path = os.path.join(adi_dir, PSF_NORMALIZED_NAME)
+    psf_source_path = os.path.join(adi_dir, PSF_SOURCE_NAME)
 
-    if not force_rerun and os.path.isfile(psf_norm_path):
+    if (
+        not force_rerun
+        and os.path.isfile(psf_norm_path)
+        and _read_psf_source(psf_source_path) == ref_path
+    ):
         log.info("=> LOADING NORMALIZED PSF")
         psfn = fr._load_fits_primary_float32(psf_norm_path)
         fwhm_path = os.path.join(adi_dir, PSF_FWHM_NAME)
@@ -163,12 +170,15 @@ def s1_build_psf(run_params):
         full_output=True,
     )
     psfn, flux, fwhm = result
+    flux = float(np.ravel(flux)[0])
     log.info("PSF normalize: FWHM=%.3f flux=%.3f", fwhm, flux)
 
     fr._save_fits_primary_float32(psfn, psf_norm_path)
     fwhm_path = os.path.join(adi_dir, PSF_FWHM_NAME)
     with open(fwhm_path, "w", encoding="utf-8") as fh:
         fh.write(f"{fwhm}\n")
+    with open(psf_source_path, "w", encoding="utf-8") as fh:
+        fh.write(f"{ref_path}\n")
     if plot_psf:
         pu.save_frame_plot(
             psfn,
@@ -634,13 +644,54 @@ def _pca_rot_kwargs(run_params):
     return kwargs
 
 
+def resolve_psf_source_path(run_params):
+    """
+    Path to the unsat average image used as the ADI PSF:
+    ``{redu_path}{unsats_dir}/{camera}/average_image.fits``.
+
+    ``unsats_dir`` is ``psf_unsats_dir`` from the ADI config when set, otherwise
+    ``unsats_dir`` from the ``process_config.txt`` snapshot in ``redu_dir``.
+    The sparkle-subtracted ``reference_sparkles.fits`` is not used because the
+    star's core cancels when the sparkle-off unsat is subtracted.
+    """
+    unsats_dir = run_params.get("psf_unsats_dir")
+    if not unsats_dir:
+        snapshot = os.path.join(run_params["redu_dir"], PROCESS_CONFIG_SNAPSHOT_NAME)
+        if not os.path.isfile(snapshot):
+            raise FileNotFoundError(
+                f"Set psf_unsats_dir in the ADI config; no {PROCESS_CONFIG_SNAPSHOT_NAME} "
+                f"in {run_params['redu_dir']} to read unsats_dir from"
+            )
+        unsats_dir = read_adi_config(snapshot).get("unsats_dir")
+        if not unsats_dir:
+            raise ValueError(
+                f"{snapshot} has no unsats_dir; set psf_unsats_dir in the ADI config"
+            )
+    return os.path.join(
+        run_params["redu_path"],
+        str(unsats_dir).strip(),
+        run_params["camera"],
+        UNSAT_AVERAGE_IMAGE_NAME,
+    )
+
+
+def _read_psf_source(path):
+    if not os.path.isfile(path):
+        return None
+    with open(path, encoding="utf-8") as fh:
+        return fh.read().strip()
+
+
 def _validate_adi_inputs(run_params):
     """Ensure process outputs exist before running ADI."""
     redu_dir = run_params["redu_dir"]
     missing = []
-    for name in (REFERENCE_IMAGE_NAME, FILE_TABLE_NAME, FILE_TABLE_OUTPUT_NAME):
+    for name in (FILE_TABLE_NAME, FILE_TABLE_OUTPUT_NAME):
         if not os.path.isfile(os.path.join(redu_dir, name)):
             missing.append(name)
+    psf_source = resolve_psf_source_path(run_params)
+    if not os.path.isfile(psf_source):
+        missing.append(psf_source)
     centered_dir = os.path.join(redu_dir, CENTERED_FRAMES_DIR)
     if not os.path.isdir(centered_dir):
         missing.append(f"{CENTERED_FRAMES_DIR}/")
@@ -776,6 +827,7 @@ def build_adi_run_params(params, camera, *, config_source_path=None):
     p["adi_dir"] = os.path.join(p["redu_dir"], p["adi_output_dir"])
     p["centered_dir"] = CENTERED_FRAMES_DIR
     p.setdefault("require_used_in_reduction", True)
+    p.setdefault("psf_unsats_dir", None)
     p.setdefault("psf_crop_size", 30)
     p.setdefault("psf_norm_size", 19)
     p.setdefault("coadd_mode", "none")

@@ -27,14 +27,16 @@ Required inputs in `{redu_path}{data_dir}/{camera}/`:
 
 | File | Source |
 |---|---|
-| `reference_sparkles.fits` | process step 1 |
+| `process_config.txt` | process config snapshot (`unsats_dir` for the PSF) |
 | `file_table.txt` | process step 0 (`PARANG`, `DATE_OBS`) |
 | `file_table_output.txt` | process step 4 (`used_in_reduction`) |
 | `centered/*.fits` | process step 3 |
 
+The PSF is read from the unsat average `{redu_path}{unsats_dir}/{camera}/average_image.fits` (preprocess step 3), not `reference_sparkles.fits`: when a sparkle-off unsat is subtracted, the star's core cancels in that image.
+
 ### Pipeline steps
 
-1. **PSF** — Center-crop `reference_sparkles.fits` to `psf_crop_size` (default 30 px), VIP `normalize_psf`, save normalized PSF and FWHM.
+1. **PSF** — Center-crop the unsat `average_image.fits` to `psf_crop_size` (default 30 px), VIP `normalize_psf`, save normalized PSF and FWHM. The source path is recorded in `psf_source.txt`; a cached PSF from a different source is rebuilt.
 2. **ADI cube** — Load centered frames that pass frame selection, optionally crop and coadd, save cube + parallactic angles.
 3. **PCA-ADI** — VIP `pca()` (subtraction, derotation, and median combine in one call).
 4. **SNR map** — VIP `snrmap()` on the final PCA frame.
@@ -56,6 +58,7 @@ Frame selection:
 
 Step 1 (PSF):
 
+- `psf_unsats_dir` — unsat directory (under `redu_path`) whose `average_image.fits` is the PSF; default `unsats_dir` from `process_config.txt`
 - `psf_crop_size` — center crop size in pixels before normalization (default `30`)
 - `psf_norm_size` — VIP `normalize_psf` fitting aperture (default `19`)
 
@@ -113,7 +116,8 @@ Written to `{redu_path}{data_dir}/{camera}/adi/` (override folder name with `adi
 |---|---|
 | `adi_config.txt` | copy of the config used for this run |
 | `adi.log` | run log |
-| `psf_30x30.fits` | center-cropped reference PSF |
+| `psf_30x30.fits` | center-cropped unsat PSF |
+| `psf_source.txt` | path of the unsat average used for the PSF |
 | `psf_normalized.fits` | VIP flux-normalized PSF |
 | `psf_fwhm.txt` | FWHM from `normalize_psf` |
 | `adi_cube.fits` | ADI datacube `(N, H, W)` |
