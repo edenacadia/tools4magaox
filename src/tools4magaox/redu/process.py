@@ -453,6 +453,7 @@ def _compute_process_filter_metrics(
         row_idxs,
         run_params,
         sigma_clip=run_params.get("rms_sigma_clip", 2.0),
+        max_value=run_params.get("rms_max"),
         n_iter=run_params.get("rms_iterations", 3),
         chunk_size=chunk_size,
     )
@@ -478,13 +479,17 @@ def _reapply_process_filters(file_table_output, row_idxs, run_params):
         radius, sigma_clip=run_params.get("max_point_sigma_clip", 2.0)
     )
     pass_cs = fl.filter_center_shifts(
-        shifts, sigma_clip=run_params.get("shift_sigma_clip", 2.0)
+        shifts,
+        sigma_clip=run_params.get("shift_sigma_clip", 2.0),
+        px_max=run_params.get("shift_px_max"),
     )
     pass_si, _ = fl.filter_speckle_intensity_values(
         intensities, sigma_clip=run_params.get("speckle_intensity_sigma_clip", 2.0)
     )
     pass_rms = fl.filter_rms_from_deviations(
-        rms_dev, sigma_clip=run_params.get("rms_sigma_clip", 2.0)
+        rms_dev,
+        sigma_clip=run_params.get("rms_sigma_clip", 2.0),
+        max_value=run_params.get("rms_max"),
     )
 
     used = pass_mp & pass_cs & pass_si & pass_rms
@@ -520,12 +525,16 @@ def _save_process_filter_plots(run_params, file_table_static, row_idxs, redu_dir
             results["shifts"],
             np.where(results["pass_cs"])[0],
             td_list,
+            sigma_clip=run_params.get("shift_sigma_clip", 2.0),
+            shift_px_max=run_params.get("shift_px_max"),
             plot_path=redu_dir,
             plt_name="4_shift_filter_timeseries.png",
         )
         fl.plot_shift_filter_scatter(
             results["shifts"],
             np.where(results["pass_cs"])[0],
+            sigma_clip=run_params.get("shift_sigma_clip", 2.0),
+            shift_px_max=run_params.get("shift_px_max"),
             plot_path=redu_dir,
             plt_name="4_shift_filter_scatter.png",
         )
@@ -539,6 +548,11 @@ def _save_process_filter_plots(run_params, file_table_static, row_idxs, redu_dir
             plt_name="4_speckle_intensity_filter_timeseries.png",
         )
     if _process_plot_enabled(run_params, "plot_rms"):
+        rms_cutoff, rms_cutoff_label = fl.rms_cutoff_threshold(
+            results["rms_dev"],
+            sigma_clip=run_params.get("rms_sigma_clip", 2.0),
+            max_value=run_params.get("rms_max"),
+        )
         fl.plot_generic_timeseries(
             results["rms_dev"],
             np.where(results["pass_rms"])[0],
@@ -546,6 +560,8 @@ def _save_process_filter_plots(run_params, file_table_static, row_idxs, redu_dir
             plot_path=redu_dir,
             plt_title="RMS deviation filter",
             plt_name="4_rms_filter_timeseries.png",
+            cutoff_high=rms_cutoff,
+            cutoff_label=rms_cutoff_label,
         )
 
 
@@ -957,6 +973,7 @@ def _filter_rms_chunked(
     run_params,
     *,
     sigma_clip,
+    max_value,
     n_iter,
     chunk_size,
 ):
@@ -1003,13 +1020,16 @@ def _filter_rms_chunked(
             for k, frame in enumerate(centered_cube):
                 rms_dev[start + k] = float(np.std(frame - good_frame))
 
-        ref = np.median(rms_dev)
-        spread = np.std(rms_dev)
-        keep = rms_dev <= ref + sigma_clip * spread
+        keep = fl.rms_pass_mask(
+            rms_dev, sigma_clip=sigma_clip, max_value=max_value
+        )
 
+    cutoff_desc = (
+        f"max_value={max_value}" if max_value is not None else f"sigma_clip={sigma_clip}"
+    )
     log.info(
-        "filter_rms: sigma_clip=%s n_iter=%s kept %s/%s frames",
-        sigma_clip,
+        "filter_rms: %s n_iter=%s kept %s/%s frames",
+        cutoff_desc,
         n_iter,
         int(np.sum(keep)),
         n,
@@ -1217,8 +1237,10 @@ def build_process_run_params(
     p.setdefault("masterdark_dir", p["redu_path"])
     p.setdefault("max_point_sigma_clip", 2.0)
     p.setdefault("shift_sigma_clip", 2.0)
+    p.setdefault("shift_px_max", None)
     p.setdefault("speckle_intensity_sigma_clip", 2.0)
     p.setdefault("rms_sigma_clip", 2.0)
+    p.setdefault("rms_max", None)
     p.setdefault("rms_iterations", 3)
     p["wavelength"] = _resolve_wavelength_for_camera(p, camera)
     if config_source_path is not None:
