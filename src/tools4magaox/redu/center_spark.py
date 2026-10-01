@@ -3,6 +3,7 @@
 # It has functions for:
 #   - simulating the sparkles given parameters
 #   - making a mask based on the expected location of the sparkles
+#   - radial profile subtraction (RPS) applied to both the reference and the sats
 #   - cross correlating a reference image with data for shifts
 
 from hcipy import *
@@ -75,22 +76,78 @@ def make_sparkle_mask(spark_ang, spark_sep, ex_data, width_r_ld=8, width_phi_rld
     return soft_mask_field
 
 
-############ Cross correlate masked unsat with masked ref image ############
+############ Radial profile subtraction ############
 
-def hpf_array(data, sigma):
+def default_rps_center(shape):
     '''
-    data here is a 2D array
+    Star pixel (y, x) used by the unsat Gaussian centering: ``shape // 2``.
     '''
-    return data - ndimage.gaussian_filter(data,sigma)
+    return (shape[0] // 2, shape[1] // 2)
+
+
+def radial_profile(image, center=None, bin_width=1.0, stat="median"):
+    '''
+    Azimuthal profile of a 2D image about ``center`` (y, x) in pixels.
+
+    The median is the default so the sparkles, which fill only a small
+    fraction of each annulus, do not leak into the profile.
+
+    Returns
+    -------
+    r_bins : ndarray
+        Mean radius of the pixels in each annulus.
+    profile : ndarray
+        ``stat`` of the pixel values in each annulus (NaN-aware).
+    '''
+    image = np.asarray(image, dtype=float)
+    if center is None:
+        center = default_rps_center(image.shape)
+    yy, xx = np.indices(image.shape)
+    r = np.hypot(yy - float(center[0]), xx - float(center[1])).ravel()
+    labels = np.floor(r / float(bin_width)).astype(int)
+    order = np.argsort(labels, kind="stable")
+    splits = np.flatnonzero(np.diff(labels[order])) + 1
+    if stat == "median":
+        reducer = np.nanmedian
+    elif stat == "mean":
+        reducer = np.nanmean
+    else:
+        raise ValueError(f"stat must be 'median' or 'mean', got {stat!r}")
+    vals = np.split(image.ravel()[order], splits)
+    radii = np.split(r[order], splits)
+    r_bins = np.array([np.mean(rr) for rr in radii])
+    profile = np.array([reducer(v) if np.any(np.isfinite(v)) else np.nan for v in vals])
+    return r_bins, profile
+
+
+def radial_profile_subtract(image, center=None, bin_width=1.0, stat="median"):
+    '''
+    Subtract the azimuthal profile (interpolated to each pixel's radius) from a
+    2D image. ``center`` is (y, x) in pixels; defaults to :func:`default_rps_center`.
+    '''
+    image = np.asarray(image, dtype=float)
+    if center is None:
+        center = default_rps_center(image.shape)
+    r_bins, profile = radial_profile(image, center=center, bin_width=bin_width, stat=stat)
+    good = np.isfinite(profile)
+    yy, xx = np.indices(image.shape)
+    r = np.hypot(yy - float(center[0]), xx - float(center[1]))
+    model = np.interp(r, r_bins[good], profile[good])
+    return image - model
+
+
+############ Cross correlate masked unsat with masked ref image ############
 
 
 # want to convolve the data cube with the masked sparkles... 
-def register_files_fft(science_cube, ref_image, mask, grid):
+def register_files_fft(science_cube, ref_image, mask, grid, rps_center=None, rps_stat="median"):
     '''
     Science_cube is a 3D array of shape (N, H, W)
-    Ref_image is a 2D array
+    Ref_image is a 2D array, already radial-profile subtracted and masked
     Mask is a Field object or 2D array on ``grid``
     Grid is a Grid object
+    rps_center is the (y, x) star pixel in the science frames used for the
+    radial profile subtraction; defaults to the frame center
     '''
     science_cube = np.asarray(science_cube)
     n_frames = science_cube.shape[0]
@@ -110,14 +167,17 @@ def register_files_fft(science_cube, ref_image, mask, grid):
 
     # One row per frame: shape (N, grid.size). A (N, H, W) Field is interpreted
     # as a higher-order tensor (N, H) layers, not N scalar frames.
-    hpf_flat = np.stack(
-        [hpf_array(frame, sigma=10).ravel() * mask_arr for frame in science_cube],
+    rps_flat = np.stack(
+        [
+            radial_profile_subtract(frame, center=rps_center, stat=rps_stat).ravel() * mask_arr
+            for frame in science_cube
+        ],
         axis=0,
     )
     # make the data cube a field
-    data_cube_hpf = Field(hpf_flat, grid)
+    data_cube_rps = Field(rps_flat, grid)
     # take the FFT to decide ideal centers
-    fourier_sci = ft_in.forward(data_cube_hpf + 0j)
+    fourier_sci = ft_in.forward(data_cube_rps + 0j)
     # cross correlate the data cube with the reference image
     xcorr = np.real(ft_out.backward(fourier_sci * ref_kernel))
     # reshape the xcorr to be a 2D array

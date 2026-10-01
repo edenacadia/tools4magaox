@@ -16,6 +16,10 @@ spark_ang = 0
 spark_sep = 20
 wavelength = [908e-9] #  615e-9
 
+# radial profile subtraction (reference + sats before cross-correlation)
+# rps_stat = "median"     # "median" (robust to sparkles) or "mean"
+# rps_center = (256, 256)  # coarse (y, x) star pixel in raw sats; default frame center
+
 # optional params
 plot = True
 force_rerun = False

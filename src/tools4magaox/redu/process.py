@@ -31,6 +31,7 @@ PROCESS_LOG_NAME = "process.log"
 FILE_TABLE_NAME = "file_table.txt"
 FILE_TABLE_OUTPUT_NAME = "file_table_output.txt"
 REFERENCE_IMAGE_NAME = "reference_sparkles.fits"
+RPS_REFERENCE_IMAGE_NAME = "reference_sparkles_rps.fits"
 MASKED_REFERENCE_IMAGE_NAME = "reference_sparkles_masked.fits"
 CENTERED_CUBE_NAME = "average_image.fits"
 MASK_IMAGE_NAME = "mask.fits"
@@ -142,8 +143,9 @@ def s0_create_filetable(run_params):
 # STEP 1 - Reference Image
 def s1_create_reference(run_params):
     '''
-    Take the unsat, and subtract the unsat nospark if available, then mask the sparkles.
-    Save full reference image, masked reference image, and mask image.
+    Take the unsat, and subtract the unsat nospark if available, radial-profile
+    subtract it, then mask the sparkles.
+    Save full reference image, RPS reference image, masked reference image, and mask image.
     '''
     # load needed parameters
     log.info("1. Making reference image")
@@ -159,12 +161,18 @@ def s1_create_reference(run_params):
     wavelength = run_params["wavelength"]
     # create paths
     reference_image_path = os.path.join(redu_dir, REFERENCE_IMAGE_NAME)
+    rps_reference_image_path = os.path.join(redu_dir, RPS_REFERENCE_IMAGE_NAME)
     masked_reference_image_path = os.path.join(redu_dir, MASKED_REFERENCE_IMAGE_NAME)
     mask_image_path = os.path.join(redu_dir, MASK_IMAGE_NAME)
     unsats_path = os.path.join(redu_path, unsats_dir, camera)
     unsats_nospark_path = os.path.join(redu_path, unsats_nospark_dir, camera)
 
-    if (not force_rerun and os.path.isfile(masked_reference_image_path)):
+    # Runs from before RPS have no RPS reference; their masked reference is not RPS'd.
+    if (
+        not force_rerun
+        and os.path.isfile(masked_reference_image_path)
+        and os.path.isfile(rps_reference_image_path)
+    ):
         log.info("=> LOADING REF IMAGE")
         masked_reference_image = fr._load_fits_primary_float32(masked_reference_image_path)
         mask_image = fr._load_fits_primary_float32(mask_image_path)
@@ -183,6 +191,9 @@ def s1_create_reference(run_params):
         log.info("=> CREATING REF IMAGE")
         # check to see if average image has been made already
         reference_image = create_reference_image(unsats_path, unsats_nospark_path)
+        rps_reference_image = cs.radial_profile_subtract(
+            reference_image, stat=run_params["rps_stat"]
+        )
         mask_field = cs.make_sparkle_mask(
             spark_ang, spark_sep, reference_image, wavelength=wavelength
         )
@@ -192,9 +203,10 @@ def s1_create_reference(run_params):
             if hasattr(mask_field, "shaped")
             else np.asarray(mask_field, dtype=np.float32)
         )
-        masked_reference_image = reference_image * mask_image
+        masked_reference_image = rps_reference_image * mask_image
         # save the reduced images
         fr._save_fits_primary_float32(reference_image, reference_image_path)
+        fr._save_fits_primary_float32(rps_reference_image, rps_reference_image_path)
         fr._save_fits_primary_float32(mask_image, mask_image_path)
         fr._save_fits_primary_float32(masked_reference_image, masked_reference_image_path)
         if save_plot:
@@ -635,7 +647,6 @@ def create_reference_image(unsats_dir, unsats_nospark_dir):
     # if we only have unsats, use that
     elif os.path.isfile(unsats_image_path):
         reference_image = fr._load_fits_primary_float32(unsats_image_path)
-        #TODO: I think I need to highpass filter if I'm only using the spark unsat
     # if we don't have any files, error
     else:
         raise ValueError(f"No unsats or unsats_nospark files found in {unsats_image_path} and {unsats_nospark_image_path}")
@@ -719,15 +730,19 @@ def center_stack(file_table, idxs, ref_image, mask, grid, params):
     """Load frames for one stack, optionally coadd, and estimate registration shifts."""
     if params.get("center_from_centered", False):
         data_cube = _load_centered_chunk(file_table, idxs, params)
+        # Centered frames already have the star on the reference center.
+        rps_center = None
     else:
         data_cube = data_cube_fom_idxs(file_table, idxs, params)
+        rps_center = params.get("rps_center")
+    rps_kwargs = dict(rps_center=rps_center, rps_stat=params.get("rps_stat", "median"))
     coadd_n = max(1, int(params.get("center_coadd_n", 1)))
     if coadd_n > 1 and len(idxs) > 1:
         coadded = np.mean(data_cube, axis=0, keepdims=True)
-        shifts = cs.register_files_fft(coadded, ref_image, mask, grid)
+        shifts = cs.register_files_fft(coadded, ref_image, mask, grid, **rps_kwargs)
         shifts = np.repeat(shifts, len(idxs), axis=0)
     else:
-        shifts = cs.register_files_fft(data_cube, ref_image, mask, grid)
+        shifts = cs.register_files_fft(data_cube, ref_image, mask, grid, **rps_kwargs)
     return shifts
 
 
@@ -1228,6 +1243,12 @@ def build_process_run_params(
     p.setdefault("chunk_size", 100)
     p.setdefault("center_coadd_n", 1)
     p.setdefault("recenter", False)
+    # Radial profile subtraction (reference + sats). rps_center is the coarse (y, x)
+    # star pixel in the raw sats; None uses the frame center.
+    p.setdefault("rps_stat", "median")
+    p.setdefault("rps_center", None)
+    if p["rps_center"] is not None:
+        p["rps_center"] = tuple(float(v) for v in p["rps_center"])
     # Optional quick-look product: save first N centered frames as a cube in step 3b.
     # Set to an int > 0 to enable.
     p.setdefault("save_centered_cube_first_n", None)
