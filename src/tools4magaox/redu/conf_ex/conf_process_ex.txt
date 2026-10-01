@@ -37,10 +37,12 @@ plot_center_shift = True
 plot_speckle_intensity = True
 plot_rms = True
 
-# step 4 process filters (sigma clip cutoffs)
+# step 4 process filters (sigma clip cutoffs; optional absolute alternatives below)
 rerun_filtering = True
 max_point_sigma_clip = 2
 shift_sigma_clip = 1.5
+# shift_px_max = 3  # alternative to shift_sigma_clip: keep mean shift ± N pixels per axis
 speckle_intensity_sigma_clip = 1.5
 rms_sigma_clip = 2
+# rms_max = 0.05  # alternative to rms_sigma_clip: keep frames with RMS deviation <= value
 rms_iterations = 3
