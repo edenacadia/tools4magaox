@@ -8,7 +8,7 @@ import sys
 
 import numpy as np
 from vip_hci.fm import normalize_psf
-from vip_hci.psfsub import pca, pca_annular, pca_grid
+from vip_hci.psfsub import pca, pca_annulus, pca_grid
 from vip_hci.metrics import snrmap
 
 from tools4magaox.redu import filereads as fr
@@ -450,18 +450,28 @@ def s5_pca_annulus_grid(run_params, cube, angs, fwhm):
     plot_step = _adi_plot_enabled(run_params, "plot_pca_annulus_grid")
 
     ncomp_ann = int(run_params.get("pca_annulus_ncomp", run_params["ncomp"]))
+    inner_mask_px = _adi_inner_mask_px(run_params)
+    ann_inrad = r_guess - annulus_width / 2.0
+    if inner_mask_px is not None and ann_inrad < inner_mask_px:
+        raise ValueError(
+            f"PCA annulus inner edge ({ann_inrad:.1f} px) lies inside the masked "
+            f"central region ({inner_mask_px:.1f} px); increase r_guess or "
+            f"decrease annulus_width"
+        )
+
     log.info(
-        "=> pca_annulus (ncomp=%s, r_guess=%.2f, annulus_width=%.2f)",
+        "=> pca_annulus (ncomp=%s, r_guess=%.2f, annulus_width=%.2f, inner_mask=%s)",
         ncomp_ann,
         r_guess,
         annulus_width,
+        inner_mask_px,
     )
-    pca_ann = pca_annular(
+    pca_ann = pca_annulus(
         cube,
         angs,
-        ncomp=ncomp_ann,
-        annulus_width=annulus_width,
-        r_guess=r_guess,
+        ncomp_ann,
+        annulus_width,
+        r_guess,
         svd_mode=run_params.get("svd_mode", "arpack"),
         **rot_kwargs,
     )
@@ -524,6 +534,8 @@ def s5_pca_annulus_grid(run_params, cube, angs, fwhm):
             ),
             **rot_kwargs,
         )
+        if inner_mask_px is not None:
+            grid_kwargs["mask_center_px"] = int(round(inner_mask_px))
         if mode == "annular":
             grid_kwargs["annulus_width"] = annulus_width
 
@@ -548,9 +560,7 @@ def _run_adi_rotation_probe(adi_dir, cube, parang, run_params):
         cube,
         parang,
         expected_r_px=run_params.get("expected_source_r_px"),
-        inner_exclude_px=run_params.get("crop_radius_inner")
-        or run_params.get("mask_center_px")
-        or 30.0,
+        inner_exclude_px=_adi_inner_mask_px(run_params) or 30.0,
         max_frames=int(run_params.get("rotation_probe_max_frames", 500)),
     )
     _write_adi_rotation_probe(adi_dir, probe, run_params)
@@ -601,6 +611,15 @@ def _write_adi_rotation_probe(adi_dir, probe, run_params):
             peak_r,
             expected,
         )
+
+
+def _adi_inner_mask_px(run_params):
+    """Inner masked radius (px) from crop_radius_inner or mask_center_px."""
+    for key in ("crop_radius_inner", "mask_center_px", "cube_mask_center_px"):
+        val = run_params.get(key)
+        if val is not None and float(val) > 0:
+            return float(val)
+    return None
 
 
 def _pca_rot_kwargs(run_params):
