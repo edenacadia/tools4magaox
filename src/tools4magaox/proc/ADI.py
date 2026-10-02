@@ -758,7 +758,13 @@ def _nonempty_camera_list(x):
 
 
 def run_adi_from_config(params, config_source_path=None):
-    """Validate config and run :func:`adi_main` for each camera."""
+    """
+    Validate config and run :func:`adi_main` for each camera.
+
+    With ``run_metrics = True``, :mod:`tools4magaox.proc.metrics` runs after ADI
+    for each camera using the same config; it reuses the ADI products just
+    written and always recomputes the metric outputs.
+    """
     missing = check_adi_config(params)
     if missing:
         raise ValueError(f"config missing or invalid keys: {missing}")
@@ -775,6 +781,19 @@ def run_adi_from_config(params, config_source_path=None):
             adi_main(run)
         except Exception:
             log.exception("Error in ADI for %s %s", data_dir, camera)
+            continue
+        if run.get("run_metrics"):
+            from tools4magaox.proc import metrics
+
+            try:
+                mrun = metrics.build_metrics_run_params(
+                    params, camera, config_source_path=config_source_path
+                )
+                mrun["force_rerun"] = False
+                mrun["rerun_metrics"] = True
+                metrics.metrics_main(mrun)
+            except Exception:
+                log.exception("Error in metrics for %s %s", data_dir, camera)
 
 
 def _resolve_crop_radius_params(params):
@@ -840,6 +859,7 @@ def build_adi_run_params(params, camera, *, config_source_path=None):
     p.setdefault("nproc", None)
     p.setdefault("batch", None)
     p.setdefault("run_pca_annulus_grid", False)
+    p.setdefault("run_metrics", False)
     p.setdefault("pca_annulus_ncomp", p.get("ncomp", 5))
     p.setdefault("annulus_width", None)
     p.setdefault("r_guess", None)

@@ -40,17 +40,18 @@ batch = 0.5
 fwhm = None
 
 # Contrast curve
-pxscale = 0.0133
-starphot = None
-# starphot_psf_exptime = 1.0
+pxscale = 0.00579   # camsci arcsec/px
+starphot = None     # None: PSF flux x (sci/psf EXPTIME) x (sci/psf EMGAIN)
+# starphot_psf_exptime = 0.115057  # default: unsat file_table.txt
+# starphot_psf_emgain = 2.0        # default: unsat file_table.txt
 contrast_sigma = 5
 contrast_nbranch = 1
 
 # Throughput
 throughput_nbranch = 1
-metrics_inner_rad = None
-fc_rad_sep = 3
-noise_sep = 1
+metrics_inner_rad = None    # px; None -> crop_radius_inner, then mask_center_px
+fc_rad_sep = 3              # annuli between injected companions
+noise_sep = 1               # annulus spacing [FWHM]
 wedge = (0, 360)
 
 # SNR source peak

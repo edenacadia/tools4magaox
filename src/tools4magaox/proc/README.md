@@ -44,6 +44,8 @@ The PSF is read from the unsat average `{redu_path}{unsats_dir}/{camera}/average
 
 Steps 1–4 skip if their outputs already exist unless `force_rerun = True`.
 
+With `run_metrics = True` in the ADI config, [`metrics.py`](metrics.py) runs after ADI for each camera using the same config (put the metrics keys in the ADI config). It reuses the ADI products just written and always recomputes the metric outputs.
+
 ### conf variables
 
 Required:
@@ -107,6 +109,7 @@ General:
 - `plot` — master switch for diagnostic PNGs (default `False`)
 - `plot_psf`, `plot_pca`, `plot_snrmap`, `plot_parang`, `plot_pca_annulus_grid` — per-step plot overrides (default to `plot`)
 - `force_rerun` — recompute steps even when outputs exist (default `False`)
+- `run_metrics` — run `metrics.py` after ADI with the same config (default `False`)
 
 ### pipeline outputs
 
@@ -179,13 +182,14 @@ Inherits ADI/reduction keys (`redu_path`, `data_dir`, `cameras`, frame selection
 - `run_throughput`, `run_contrast`, `run_source_peak` — default on/off when no CLI flags
 - `metrics_output_dir` — output subdirectory (default `"metrics"`)
 - `pxscale` — arcsec/px (required for contrast curve)
-- `starphot` — star flux in coronagraphic frames; `None` auto-derives from PSF flux and EXPTIME ratio
-- `starphot_psf_exptime` — reference PSF exposure time for starphot scaling (optional)
+- `starphot` — star flux in coronagraphic frames; `None` auto-derives from the PSF flux times the science/PSF EXPTIME and EMGAIN ratios
+- `starphot_psf_exptime`, `starphot_psf_emgain` — PSF exposure time and EM gain for that scaling; default read from the unsat `file_table.txt` next to the PSF image
 - `contrast_sigma`, `throughput_nbranch`, `contrast_nbranch` — VIP sampling controls
-- `metrics_inner_rad`, `fc_rad_sep`, `noise_sep`, `wedge` — fake-companion injection geometry
+- `metrics_inner_rad`, `fc_rad_sep`, `noise_sep`, `wedge` — fake-companion injection geometry. `metrics_inner_rad` is in pixels (default `crop_radius_inner`, then `mask_center_px`). `noise_sep` is the annulus spacing in FWHM (VIP itself takes px). `fc_rad_sep` is the number of annuli between injected companions, so it is in units of `noise_sep`
 - `expected_source_r_px`, `source_peak_inner_exclude_px`, `source_peak_annulus_half_width` — SNR peak search
 - `plot_throughput`, `plot_contrast`, `plot_source_peak` — diagnostic PNGs
-- `force_rerun` — recompute even when outputs exist
+- `force_rerun` — recompute even when outputs exist (ADI inputs and metric outputs)
+- `rerun_metrics` — recompute metric outputs only (default `force_rerun`)
 
 Example config: [`conf_ex/conf_metrics_ex.txt`](conf_ex/conf_metrics_ex.txt)
 

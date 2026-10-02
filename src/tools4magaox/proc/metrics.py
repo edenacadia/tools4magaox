@@ -99,18 +99,20 @@ def metrics_main(
         need_pca=need_pca_snr,
         need_snr=need_pca_snr,
     )
+    if run_params.get("fwhm_override") is not None:
+        fwhm = float(run_params["fwhm_override"])
     run_params["fwhm"] = fwhm
 
     if do_throughput:
         out_path = os.path.join(metrics_dir, THROUGHPUT_CSV_NAME)
-        if run_params["force_rerun"] or not os.path.isfile(out_path):
+        if run_params["rerun_metrics"] or not os.path.isfile(out_path):
             measure_throughput(cube, parang, psfn, fwhm, run_params)
         else:
             log.info("=> THROUGHPUT EXISTS, SKIPPING")
 
     if do_contrast:
         out_path = os.path.join(metrics_dir, CONTRAST_CSV_NAME)
-        if run_params["force_rerun"] or not os.path.isfile(out_path):
+        if run_params["rerun_metrics"] or not os.path.isfile(out_path):
             measure_contrast_curve(
                 cube,
                 parang,
@@ -125,7 +127,7 @@ def metrics_main(
 
     if do_source_peak:
         out_path = os.path.join(metrics_dir, SOURCE_PEAK_TXT_NAME)
-        if run_params["force_rerun"] or not os.path.isfile(out_path):
+        if run_params["rerun_metrics"] or not os.path.isfile(out_path):
             find_significant_source(snr_map, fwhm, run_params)
         else:
             log.info("=> SOURCE PEAK EXISTS, SKIPPING")
@@ -208,7 +210,7 @@ def measure_throughput(cube, parang, psfn, fwhm, run_params):
     metrics_dir = run_params["metrics_dir"]
     log.info("=> RUNNING VIP throughput()")
     algo_dict = _pca_algo_kwargs(run_params)
-    inner_rad = _metrics_inner_rad(run_params)
+    inner_rad = _vip_inner_rad(run_params, fwhm)
     nbranch = int(run_params.get("throughput_nbranch", 1))
 
     res = throughput(
@@ -220,14 +222,14 @@ def measure_throughput(cube, parang, psfn, fwhm, run_params):
         nbranch=nbranch,
         inner_rad=inner_rad,
         fc_rad_sep=int(run_params.get("fc_rad_sep", 3)),
-        noise_sep=int(run_params.get("noise_sep", 1)),
+        noise_sep=_vip_noise_sep_px(run_params, fwhm),
         wedge=tuple(run_params.get("wedge", (0, 360))),
         full_output=True,
         verbose=True,
         **algo_dict,
     )
 
-    table = _vip_result_table(res)
+    table = _throughput_table(res, fwhm)
     csv_path = os.path.join(metrics_dir, THROUGHPUT_CSV_NAME)
     pu.save_dataframe_csv(table, csv_path)
     log.info("Saved throughput: %s", csv_path)
@@ -274,7 +276,7 @@ def measure_contrast_curve(
 
     log.info("=> RUNNING VIP contrast_curve()")
     algo_dict = _pca_algo_kwargs(run_params)
-    inner_rad = _metrics_inner_rad(run_params)
+    inner_rad = _vip_inner_rad(run_params, fwhm)
     nbranch = int(run_params.get("contrast_nbranch", 1))
     sigma = float(run_params.get("contrast_sigma", 5))
 
@@ -290,7 +292,7 @@ def measure_contrast_curve(
         nbranch=nbranch,
         inner_rad=inner_rad,
         fc_rad_sep=int(run_params.get("fc_rad_sep", 3)),
-        noise_sep=int(run_params.get("noise_sep", 1)),
+        noise_sep=_vip_noise_sep_px(run_params, fwhm),
         wedge=tuple(run_params.get("wedge", (0, 360))),
         full_output=True,
         plot=False,
@@ -393,6 +395,9 @@ def build_metrics_run_params(params, camera, *, config_source_path=None):
     p.setdefault("pxscale", None)
     p.setdefault("starphot", None)
     p.setdefault("starphot_psf_exptime", None)
+    p.setdefault("starphot_psf_emgain", None)
+    # Recompute metric outputs; separate from force_rerun, which also rebuilds ADI inputs.
+    p.setdefault("rerun_metrics", p["force_rerun"])
     p.setdefault("contrast_sigma", 5)
     p.setdefault("throughput_nbranch", 1)
     p.setdefault("contrast_nbranch", 1)
@@ -507,15 +512,27 @@ def _pca_algo_kwargs(run_params):
     batch = run_params.get("batch")
     if batch is not None:
         kwargs["batch"] = batch
-    fwhm = run_params.get("fwhm")
-    if run_params.get("fwhm_override") is not None:
-        fwhm = run_params["fwhm_override"]
-    if fwhm is not None:
-        kwargs["fwhm"] = fwhm
     nproc = run_params.get("nproc")
     if nproc is not None:
         kwargs["nproc"] = nproc
     return kwargs
+
+
+def _vip_noise_sep_px(run_params, fwhm):
+    """Annulus spacing in px; config ``noise_sep`` is in FWHM units."""
+    return float(run_params.get("noise_sep", 1)) * float(fwhm)
+
+
+def _vip_inner_rad(run_params, fwhm):
+    """
+    1-based index of the first VIP annulus at or beyond :func:`_metrics_inner_rad` (px).
+
+    VIP places annulus ``k`` (0-based) at ``fwhm + k * noise_sep`` px and keeps
+    ``vector_radd[inner_rad - 1:]``.
+    """
+    sep = _vip_noise_sep_px(run_params, fwhm)
+    k = np.ceil((_metrics_inner_rad(run_params) - float(fwhm)) / sep)
+    return max(1, int(k) + 1)
 
 
 def _metrics_inner_rad(run_params):
@@ -535,8 +552,10 @@ def _derive_starphot(run_params, file_table_static, file_table_output):
     """
     Estimate star flux in coronagraphic frames from reference PSF normalization.
 
-    Scales the PSF integrated flux by the median science EXPTIME divided by the
-    reference PSF EXPTIME.
+    Scales the PSF integrated flux by the science / PSF ratios of median EXPTIME
+    and EMGAIN. The PSF values come from ``starphot_psf_exptime`` /
+    ``starphot_psf_emgain`` when set, otherwise from the unsat ``file_table.txt``
+    next to the PSF source image.
     """
     psf_crop_size = int(run_params.get("psf_crop_size", 30))
     psf_norm_size = int(run_params.get("psf_norm_size", 19))
@@ -558,36 +577,42 @@ def _derive_starphot(run_params, file_table_static, file_table_output):
     if len(row_idxs) == 0:
         raise ValueError("No frames available for starphot EXPTIME median")
 
-    exptimes = np.asarray(
-        file_table_static["EXPTIME"][row_idxs], dtype=float
-    )
-    finite = np.isfinite(exptimes) & (exptimes > 0)
-    if not np.any(finite):
-        raise ValueError(
-            "Cannot derive starphot: no finite positive EXPTIME in selected frames"
-        )
-    sci_exptime = float(np.median(exptimes[finite]))
+    sci_exptime = _median_positive(file_table_static, "EXPTIME", row_idxs, "science")
+    sci_emgain = _median_positive(file_table_static, "EMGAIN", row_idxs, "science")
 
-    psf_exptime = run_params.get("starphot_psf_exptime")
-    if psf_exptime is not None:
-        psf_exptime = float(psf_exptime)
-    else:
-        psf_exptime = sci_exptime
-        log.warning(
-            "starphot_psf_exptime not set; assuming PSF and science share "
-            "median EXPTIME=%.6g s",
-            sci_exptime,
-        )
+    psf_table_path = os.path.join(os.path.dirname(ref_path), ADI.FILE_TABLE_NAME)
+    psf_table = fr.read_redu_table(psf_table_path) if os.path.isfile(psf_table_path) else None
+    psf_vals = {}
+    for key, col in (("starphot_psf_exptime", "EXPTIME"), ("starphot_psf_emgain", "EMGAIN")):
+        if run_params.get(key) is not None:
+            psf_vals[col] = float(run_params[key])
+        elif psf_table is not None:
+            psf_vals[col] = _median_positive(psf_table, col, np.arange(len(psf_table)), "PSF")
+        else:
+            raise ValueError(
+                f"Cannot derive starphot: set {key} or provide {psf_table_path}"
+            )
 
-    starphot = flux * (sci_exptime / psf_exptime)
+    starphot = flux * (sci_exptime / psf_vals["EXPTIME"]) * (sci_emgain / psf_vals["EMGAIN"])
     log.info(
-        "Derived starphot=%.3g (PSF flux=%.3g, sci_exptime=%.6g, psf_exptime=%.6g)",
+        "Derived starphot=%.3g (PSF flux=%.3g; EXPTIME sci/psf=%.6g/%.6g s; "
+        "EMGAIN sci/psf=%.6g/%.6g)",
         starphot,
         flux,
         sci_exptime,
-        psf_exptime,
+        psf_vals["EXPTIME"],
+        sci_emgain,
+        psf_vals["EMGAIN"],
     )
     return starphot
+
+
+def _median_positive(table, col, row_idxs, label):
+    vals = np.asarray(table[col][row_idxs], dtype=float)
+    vals = vals[np.isfinite(vals) & (vals > 0)]
+    if vals.size == 0:
+        raise ValueError(f"Cannot derive starphot: no finite positive {col} in {label} frames")
+    return float(np.median(vals))
 
 
 def _mask_inner_for_peak(snr_map, run_params):
@@ -605,14 +630,40 @@ def _mask_inner_for_peak(snr_map, run_params):
 
 
 def _vip_result_table(res):
-    """Normalize VIP throughput/contrast return value to a pandas DataFrame."""
+    """Normalize VIP contrast_curve return value (DataFrame, or tuple led by one) to a DataFrame."""
     import pandas as pd
 
+    if isinstance(res, tuple):
+        res = res[0]
     if isinstance(res, pd.DataFrame):
         return res
     if isinstance(res, dict):
         return pd.DataFrame(res)
     raise TypeError(f"Unexpected VIP metrics return type: {type(res)!r}")
+
+
+def _throughput_table(res, fwhm):
+    """
+    Build a DataFrame from VIP ``throughput(..., full_output=True)``.
+
+    VIP returns ``(thruput_arr[nbranch, nann], noise, res_level, vector_radd, ...)``
+    with ``vector_radd`` in px (VIP's docstring says FWHM, but the values are px).
+    """
+    import pandas as pd
+
+    thruput_arr = np.atleast_2d(np.asarray(res[0], dtype=float))
+    radd = np.asarray(res[3], dtype=float)
+    cols = {
+        "distance": radd,
+        "distance_fwhm": radd / float(fwhm),
+        "throughput": np.nanmean(thruput_arr, axis=0),
+    }
+    if thruput_arr.shape[0] > 1:
+        for b in range(thruput_arr.shape[0]):
+            cols[f"throughput_branch{b}"] = thruput_arr[b]
+    cols["noise"] = np.asarray(res[1], dtype=float)
+    cols["residual_level"] = np.asarray(res[2], dtype=float)
+    return pd.DataFrame(cols)
 
 
 def _metric_enabled(run_params, config_key, cli_override):
@@ -673,6 +724,10 @@ def _plot_contrast(table, run_params, path):
         y = table["contrast"].to_numpy(dtype=float)
     elif "contrast_curve" in table.columns:
         y = table["contrast_curve"].to_numpy(dtype=float)
+    elif "sensitivity_student" in table.columns:
+        y = table["sensitivity_student"].to_numpy(dtype=float)
+    elif "sensitivity_gaussian" in table.columns:
+        y = table["sensitivity_gaussian"].to_numpy(dtype=float)
     else:
         raise ValueError(f"contrast table missing contrast column: {list(table.columns)}")
 

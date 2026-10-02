@@ -47,6 +47,9 @@ batch = 0.5
 # Step 4 — SNR map (None → FWHM from normalize_psf)
 fwhm = None
 
+# run metrics.py after ADI with this config (add the metrics keys from conf_metrics_ex.txt)
+run_metrics = False
+
 # Step 5 — optional PCA annulus + PCA grid (VIP tutorial 3.5.6)
 # Runs whenever True, independent of force_rerun
 run_pca_annulus_grid = False
