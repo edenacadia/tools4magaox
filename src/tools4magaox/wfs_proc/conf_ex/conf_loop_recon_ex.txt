@@ -1,0 +1,42 @@
+# Example loop-reconstruction config
+# Run: python -m tools4magaox.wfs_proc.loop_reconstruction conf_loop_recon_ex.txt
+
+# --- 1. Load WFS frames -------------------------------------------------
+wfs_data_path = "/srv/nas/magaox_rawdata/rtc/rawimages/camwfs/"
+stream_name = "camwfs"
+# Flat directory of ~1.5e6 files; cache speeds up later runs
+wfs_index_cache = "/home/eden/data/wfs_proc/camwfs_index.txt"
+
+t_start = "2023-03-10T06:55:34"
+duration_s = 2.0
+# t_end = "2023-03-10T06:55:10"   # use instead of duration_s
+
+wfs_shape = (120, 120)
+
+# --- 2. WFS frames -> delta wavefront -----------------------------------
+wfs_dark_dir = "/srv/nas/magaox_rawdata/rtc/calib/camwfs-dark/"
+# Optional substring filter on dark filenames (binning / fps / gain)
+dark_name_filter = "bin2_"
+
+cacao_calib_dir = "/srv/nas/magaox_rawdata/rtc/cacao_pre20230823/tweeter/tweeter001/AOcalibs"
+aocalib_set = "tweeter001"
+# Optional per-file overrides:
+# modes_wfs_path = ".../aol1_modesWFS.fits"
+# dm_modes_path = ".../aol1_DMmodes_WFSdiag.fits"
+# wfs_mask_path = ".../aol1_wfsmask.fits"
+# wfs_ref_path = ".../aol1_wfsref.fits"
+# dm_mask_path = ".../aol1_dmmask.fits"
+
+recon_method = "modenorm"   # or "pinv"
+dm_units_to_nm = 1000.0     # DM surface units are microns
+opd_factor = 2.0              # reflection: surface -> OPD
+recon_sign = 1.0
+
+# --- 3. Delta wavefronts -> open loop -----------------------------------
+integration_time_s = 10.0
+integration_gain = 1.0
+
+# --- outputs ------------------------------------------------------------
+output_dir = "/home/eden/data/wfs_proc/loop_recon_ex/"
+save_modal_coeffs = True
+save_delta_cube = False  # set True to also write per-frame delta_wf_nm.fits
